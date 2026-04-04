@@ -39,8 +39,8 @@ fs-tmpfs [options] /mount/point
 ### Subsequent Mounts
 ```
 fs-tmpfs [options] /another/point
-  → coordinator found via name_open("/dev/fs-tmpfs")
-  → send DCMD_TMPFS_ADD_MOUNT with path + options
+  → coordinator found via open(TMPFS_CTRL_PATH, O_RDWR)
+  → send DCMD_TMPFS_ADD_MOUNT via devctl()
   → coordinator performs resmgr_attach() internally
   → invoking process exits cleanly
 ```
@@ -63,11 +63,16 @@ umount /mount/point
 
 ### Global Cap
 
-Total physical RAM is read at startup via:
+Total physical RAM is read at startup by messaging the QNX memory manager:
 ```c
-sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE)
+mem_info_t msg;
+msg.i.type = _MEM_INFO;  msg.i.fd = NOFD;  msg.i.flags = 0;
+MsgSend(MEMMGR_COID, &msg.i, sizeof(msg.i), &msg.o, sizeof(msg.o));
+uint64_t total_ram = (uint64_t)msg.o.info.__posix_tmi_total;
 ```
 `global_cap = total_ram / 2` — fixed at startup, never changes.
+
+> **Note:** `sysconf(_SC_PHYS_PAGES)` returns -1 on QNX 8 and must not be used. See Implementation Note 1.
 
 ### Two-Level Check
 
@@ -152,89 +157,141 @@ Shrink condition: if current_size < capacity / 4
 ### Mount (`tmpfs_mount_t`)
 ```
 tmpfs_mount_t
-  ├── mount_cap, mount_used
-  ├── root_inode*
-  ├── resmgr_attr, mount_id
-  ├── pthread_rwlock_t tree_lock
-  └── inode_table (hash map: ino_t → inode*)
+  ├── mount_cap                    ← maximum bytes this mount may use
+  ├── mount_used (atomic)          ← bytes currently charged to this mount
+  ├── file_count (atomic_uint_fast64_t)
+  ├── dir_count  (atomic_uint_fast64_t)
+  ├── symlink_count (atomic_uint_fast64_t)
+  ├── inode_count (atomic_uint_fast64_t)
+  ├── resmgr_id                    ← id from resmgr_attach()
+  ├── iofunc_mount_t iofunc_mount  ← QNX mount info (blocksize, dev, funcs)
+  ├── root*                        ← root directory inode
+  ├── next*                        ← coordinator linked list
+  └── path[PATH_MAX]               ← mount point path (for stats)
 ```
 
 ### Inode (`tmpfs_inode_t`)
 ```
 tmpfs_inode_t
-  ├── iofunc_attr_t attr           ← QNX standard (uid, gid, mode, times, size)
-  ├── ino_t ino_id
-  ├── uint32_t link_count          ← hard links
-  ├── uint32_t ref_count           ← open handles (prevents delete while open)
-  ├── pthread_rwlock_t lock
-  ├── tmpfs_mount_t* mount         ← back pointer for accounting
+  ├── iofunc_attr_t attr           ← MUST BE FIRST (uid, gid, mode, times, nlink, size)
+  ├── tmpfs_mount_t* mount         ← back-pointer for accounting
+  ├── uint32_t ref_count           ← open OCB count (protected by attr.lock)
   │
-  ├── [FILE]    int shm_fd         ← SHM_ANON fd
-  │             void* shm_ptr      ← server-side mmap of shm
-  │             size_t capacity    ← allocated shm size (may exceed file size)
+  ├── [FILE]    int shm_fd         ← SHM_ANON fd (-1 if not a file)
+  │             void* shm_ptr      ← server-side mmap of the shm object
+  │             size_t shm_cap     ← allocated shm capacity (may exceed file size)
   │
-  ├── [DIR]     hash_map<name → inode*> children
+  ├── [DIR]     tmpfs_dirent_t* hash[16]  ← children hash table (16 buckets)
   │             tmpfs_inode_t* parent
+  │             uint32_t child_count
   │
-  └── [SYMLINK] char* target
+  └── [SYMLINK] char* symlink_target      ← heap-allocated target path
+```
+
+### Directory Entry (`tmpfs_dirent_t`)
+```
+tmpfs_dirent_t
+  ├── char* name                   ← heap-allocated filename
+  ├── tmpfs_inode_t* inode         ← target inode
+  └── tmpfs_dirent_t* next         ← next in hash bucket chain
 ```
 
 ### Open Control Block (`tmpfs_ocb_t`)
 ```
-tmpfs_ocb_t                        ← must extend iofunc_ocb_t
-  ├── iofunc_ocb_t ocb             ← must be first field
-  ├── tmpfs_inode_t* inode
-  └── int mmap_flags
+tmpfs_ocb_t
+  ├── iofunc_ocb_t ocb             ← MUST BE FIRST (QNX framework requirement)
+  ├── tmpfs_inode_t* inode         ← the inode this OCB refers to
+  └── uint32_t dir_pos             ← readdir position (0='.', 1='..', 2+=children)
+```
+
+### Global Coordinator State (`tmpfs_global_t`)
+```
+tmpfs_global_t  (g_tmpfs — process-wide singleton)
+  ├── total_ram, global_cap        ← RAM budget (fixed at startup)
+  ├── global_used (atomic)         ← bytes in use across ALL mounts
+  ├── mounts*                      ← linked list of active mounts
+  ├── mount_count
+  ├── mounts_lock (pthread_rwlock_t) ← protects mounts list
+  ├── ctrl_resmgr_id               ← /dev/fs-tmpfs attachment id
+  ├── dpp*                         ← dispatch context
+  ├── pool*                        ← thread pool
+  ├── connect_funcs, io_funcs      ← shared handler tables for all mounts
+  ├── ctrl_connect_funcs, ctrl_io_funcs  ← handler tables for /dev/fs-tmpfs
+  ├── ctrl_attr, ctrl_mount        ← iofunc attrs for control device
+  └── start_time                   ← for uptime_ms in stats
 ```
 
 ---
 
 ## Threading Model — Thread Pool
 
-Uses `thread_pool_create()` dispatch loop:
+Uses `thread_pool_create()` / `thread_pool_start()` dispatch loop:
 
 ```
 lo_water  = 2
-hi_water  = ncpus * 2
+hi_water  = ncpus * 2   (TMPFS_POOL_HI_WATER_PER_CPU = 2)
 increment = 1
 maximum   = 32
 ```
 
-### Locking Hierarchy
+The thread pool uses `resmgr_context_alloc`, `resmgr_block`, `resmgr_handler`,
+and `resmgr_context_free` — not the `dispatch_*` variants.
 
-Must always be acquired in this order to prevent deadlock:
+### Locking
 
-```
-1. global_used_mutex       (brief, only for atomic check+add)
-2. mount->tree_rwlock      (protects directory tree structure)
-3. inode->lock             (protects inode data and metadata)
-```
+The implementation uses two synchronisation primitives:
 
-Per-inode reader-writer locks allow concurrent reads on different files to run fully in parallel.
+1. **`g_tmpfs.mounts_lock`** (`pthread_rwlock_t`) — protects the global mount
+   linked list and `mount_count`. Held briefly for list traversal and
+   modification.
+
+2. **`inode->attr.lock`** (embedded `pthread_mutex_t` inside `iofunc_attr_t`)
+   — the standard QNX iofunc attribute lock, acquired automatically by
+   `iofunc_lock_ocb_default` / `iofunc_unlock_ocb_default` around every IO
+   handler call. Protects per-inode data and metadata.
+
+Memory counters (`global_used`, `mount_used`, stat counters) use C11
+`_Atomic` / `atomic_fetch_add` — no mutex required for those.
+
+> **Note:** The design originally called for per-mount `tree_rwlock` and
+> per-inode `pthread_rwlock_t`. The implementation uses the simpler iofunc
+> attr mutex for inode protection, which is sufficient for correct operation.
 
 ---
 
-## IO Handler Coverage
+## Handler Coverage
 
-| Handler          | Notes                                                          |
-|------------------|----------------------------------------------------------------|
-| `io_open`        | Lookup/create inode, allocate OCB                              |
-| `io_close`       | Decref, free inode if unlinked and refcount == 0               |
-| `io_read`        | Copy from `shm_ptr` + offset                                   |
-| `io_write`       | Grow shm if needed (check caps), copy in                       |
-| `io_seek`        | Update OCB offset                                              |
-| `io_stat`        | Return `iofunc_attr_t` data                                    |
-| `io_chmod`       | Update attr, check permissions                                 |
-| `io_chown`       | Update attr, check permissions                                 |
-| `io_truncate`    | Resize shm, adjust accounting                                  |
-| `io_readdir`     | Walk children hash map                                         |
-| `io_link`        | Add dirent, increment `link_count`                             |
-| `io_unlink`      | Remove dirent, decrement `link_count`, free inode if 0         |
-| `io_rename`      | Atomic: unlink old name, link new name                         |
-| `io_symlink`     | Create SYMLINK inode with target string                        |
-| `io_readlink`    | Return target string                                           |
-| `io_mmap`        | Redirect client to underlying shm fd (zero copy)               |
-| `io_sync`/`msync`| Update `mtime` on dirty shm pages                             |
+The implementation splits handlers across connect functions (path-level
+operations, no OCB) and IO functions (fd-level operations, OCB exists).
+
+### Connect Handlers (`resmgr_connect_funcs_t`)
+
+| Handler       | Implementation           | Notes                                              |
+|---------------|--------------------------|----------------------------------------------------||
+| `open`        | `tmpfs_connect_open`     | Path walk, O_CREAT, symlink follow, OCB alloc      |
+| `unlink`      | `tmpfs_connect_unlink`   | File and empty-dir removal                         |
+| `rename`      | `tmpfs_connect_rename`   | Atomic src→dst, handles existing dst               |
+| `mknod`       | `tmpfs_connect_mknod`    | `mkdir()` and `mknod()` arrive here (subtype=5)    |
+| `readlink`    | `tmpfs_connect_readlink` | Returns target via `MsgReplyv(EOK, link_reply)`    |
+| `link`        | `tmpfs_connect_link`     | Hard links and symlink creation (extra_type check) |
+
+### IO Handlers (`resmgr_io_funcs_t`)
+
+| Handler      | Implementation          | Notes                                               |
+|--------------|-------------------------|-----------------------------------------------------|
+| `read`       | `tmpfs_io_read`         | File data read OR readdir (xtype check)             |
+| `write`      | `tmpfs_io_write`        | Grows shm as needed, checks both caps               |
+| `close_ocb`  | `tmpfs_io_close_ocb`    | Unrefs inode after `iofunc_close_ocb_default`       |
+| `stat`       | `iofunc_stat_default`   | Standard iofunc default                             |
+| `lseek`      | `iofunc_lseek_default`  | Standard iofunc default                             |
+| `chmod`      | `iofunc_chmod_default`  | Standard iofunc default                             |
+| `chown`      | `iofunc_chown_default`  | Standard iofunc default                             |
+| `utime`      | `iofunc_utime_default`  | Standard iofunc default                             |
+| `mmap`       | `tmpfs_io_mmap`         | Redirects to shm fd via `SERVER_SHMEM_OBJECT`       |
+| `sync`       | `tmpfs_io_sync`         | Updates mtime (no actual flush needed)              |
+| `space`      | `tmpfs_io_space`        | Handles `truncate`, `ftruncate`, `fallocate`        |
+| `lock_ocb`   | `iofunc_lock_ocb_default`   | Standard iofunc default                         |
+| `unlock_ocb` | `iofunc_unlock_ocb_default` | Standard iofunc default                         |
 
 ---
 
@@ -255,21 +312,26 @@ A pseudo-device registered by the coordinator. Used for both mount management an
 
 ```c
 typedef struct tmpfs_global_stats {
-    uint64_t total_ram;       // total system RAM in bytes
-    uint64_t global_cap;      // 50% of total_ram
-    uint64_t global_used;     // bytes in use across all mounts
-    uint32_t mount_count;     // number of active mounts
-    uint64_t uptime_ms;       // ms since coordinator started
+    uint32_t    version_major;      // driver version
+    uint32_t    version_minor;
+    uint32_t    version_patch;
+    uint32_t    _pad;
+    uint64_t    total_ram;          // total system RAM, bytes
+    uint64_t    global_cap;         // 50% of total_ram
+    uint64_t    global_used;        // bytes in use across all mounts
+    uint32_t    mount_count;        // number of active mounts
+    uint32_t    _pad2;
+    uint64_t    uptime_ms;          // ms since coordinator started
 } tmpfs_global_stats_t;
 
 typedef struct tmpfs_mount_stats {
-    char     path[PATH_MAX];  // mount point path
-    uint64_t mount_cap;       // per-mount size limit
-    uint64_t mount_used;      // bytes currently in use
-    uint64_t file_count;      // number of regular files
-    uint64_t dir_count;       // number of directories
-    uint64_t symlink_count;   // number of symlinks
-    uint64_t inode_count;     // total inodes (all types)
+    char        path[PATH_MAX];     // mount point path (input for GET_MOUNT)
+    uint64_t    mount_cap;          // per-mount size limit, bytes
+    uint64_t    mount_used;         // bytes currently in use
+    uint64_t    file_count;         // number of regular files
+    uint64_t    dir_count;          // number of directories
+    uint64_t    symlink_count;      // number of symlinks
+    uint64_t    inode_count;        // total inodes (all types)
 } tmpfs_mount_stats_t;
 ```
 
@@ -280,24 +342,23 @@ typedef struct tmpfs_mount_stats {
 ```
 fs-tmpfs/
 ├── Makefile
-├── DESIGN.md
 ├── include/
-│   ├── fs-tmpfs.h          ← shared types, constants, compile-time config
-│   ├── tmpfs_ipc.h         ← DCMD_* definitions and stats structs (public API)
-│   └── tmpfs_internal.h    ← internal structs: inode, mount, ocb
+│   ├── fs-tmpfs.h          ← compile-time constants (pool sizes, shm thresholds, etc.)
+│   ├── tmpfs_ipc.h         ← public API: DCMD_* macros, stats structs, request structs
+│   └── tmpfs_internal.h    ← internal structs: inode, mount, ocb, global state
 ├── src/
-│   ├── main.c              ← entry point, coordinator bootstrap, RAM cap calc
-│   ├── resmgr.c            ← dispatch loop, thread pool, handler registration
-│   ├── mount.c             ← mount attach/detach, -o parsing, lifecycle
-│   ├── inode.c             ← inode alloc/free/lookup, refcount, ino generation
-│   ├── dir.c               ← readdir, link, unlink, rename
-│   ├── file.c              ← read, write, truncate, shm growth
-│   ├── mmap.c              ← io_mmap handler, msync, dirty mtime tracking
-│   ├── symlink.c           ← symlink create and readlink
-│   ├── memory.c            ← global + per-mount accounting, atomic ops
-│   └── control.c           ← /dev/fs-tmpfs pseudo-device, devctl handlers
+│   ├── main.c              ← entry point, -o parsing, coordinator bootstrap, RAM detection
+│   ├── resmgr.c            ← all connect + IO handlers, thread pool, iofunc_funcs_t
+│   ├── mount.c             ← mount attach/detach, size option parsing, tree teardown
+│   ├── inode.c             ← inode alloc/free, ref counting, inode number generation
+│   ├── dir.c               ← hash table ops: lookup, insert, remove, get_nth, walk
+│   ├── file.c              ← read, write, truncate, shm growth/shrink strategy
+│   ├── mmap.c              ← io_mmap handler, io_sync handler
+│   ├── symlink.c           ← symlink_create, symlink_read
+│   ├── memory.c            ← two-level atomic accounting: reserve, release
+│   └── control.c           ← /dev/fs-tmpfs resmgr: devctl handlers, stats
 └── tools/
-    └── tmpfs-stat.c        ← CLI stats tool (uses only tmpfs_ipc.h)
+    └── tmpfs-stat.c        ← CLI stats tool (only needs tmpfs_ipc.h)
 ```
 
 ### Build Order (minimises dependency issues)
@@ -322,25 +383,29 @@ fs-tmpfs/
 
 ## New Session Bootstrap Instructions
 
-Before writing any code or answering any questions, read the following files **in full** in this exact order:
+Before writing any code or answering any questions:
 
-```
-1. DESIGN.md
-```
+1. Read **`DESIGN.md`** in full — this file.
+2. Run `ls -R fs-tmpfs/` to confirm the current state of the source tree.
+3. Run `cd fs-tmpfs && make` to confirm it still builds clean before touching anything.
 
-That is the single source of truth for this project. It contains all architectural decisions and the reasoning behind them, data structures, locking hierarchy, threading model, IO handler table, mount option parsing rules, stats/control channel IPC design, source layout and build order, and QNX 8.0.3 specific notes.
-
-After reading it, check which files already exist in the project directory with `ls -R` to determine current progress before doing anything else. Then proceed to the next incomplete step in the build order.
+This file is the single source of truth. It reflects the **as-built** implementation, not the original design. The Implementation Notes section documents every non-obvious QNX-specific decision made during development.
 
 ---
 
-## QNX 8.0.3 Specific Notes
+## QNX 8.0.3 Environment Notes
 
-- `SHM_ANON` is fully supported — use for all file data backing
-- `iofunc_mmap()` default helper does **not** handle anonymous shm redirection — write a custom `io_mmap` handler
-- `procmgr_ability()` is available if elevated privileges are ever needed (not expected for normal tmpfs operation)
-- Use `SIGTERM` / `procmgr_daemon()` for clean daemonisation
-- Thread pool via `thread_pool_create()` / `thread_pool_start()` is the correct QNX idiom for multi-threaded resmgr
+- **Compiler**: `clang` (QNX clang 21.1.3, target `aarch64-unknown-qnx`). No `qcc` on self-hosted systems.
+- **Libraries**: All resmgr, iofunc, and thread pool symbols are in `libc.so`. No separate `-lresmgr` needed.
+- **`SHM_ANON`**: Fully supported — used for all file data backing.
+- **`iofunc_mmap()` default**: Does not handle anonymous shm redirection — a custom `io_mmap` handler is required.
+- **`procmgr_ability()`**: Must be called before `procmgr_daemon()` to allow non-root `resmgr_attach()`.
+- **`procmgr_daemon()`**: Forks the process. All initialisation (dispatch, resmgr, thread pool) happens in the child, after the call.
+- **`sysconf(_SC_PHYS_PAGES)`**: Returns -1 — unusable. Use `MsgSend(MEMMGR_COID, _MEM_INFO)` instead.
+- **`iofunc_check_access()`**: Broken for non-root users on QNX 8 — always returns EPERM. Use manual mode-bit check.
+- **`_FTYPE_MOUNT`**: Required for filesystem-style mounts. `_FTYPE_ANY` breaks directory opens.
+- **`_RESMGR_FLAG_BEFORE`**: Required when mounting over an existing real directory.
+- **`O_WRONLY == 1 == _IO_FLAG_RD`**: Never check `O_WRONLY` directly in connect handlers.
 
 ---
 
