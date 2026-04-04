@@ -1,0 +1,29 @@
+# fs-tmpfs — QNX 8 tmpfs filesystem driver
+
+# ── Build artefacts ─────────────────────────────────────────────────────────
+fs-tmpfs/fs-tmpfs
+fs-tmpfs/tmpfs-stat
+
+# Object files
+fs-tmpfs/src/*.o
+fs-tmpfs/tools/*.o
+
+# Stale Makefiles from experimentation
+fs-tmpfs/Makefile.asan
+fs-tmpfs/Makefile.debug
+
+# ── Editor & IDE artefacts ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Debug / core dumps ──────────────────────────────────────────────────────
+core
+core.*
+*.core
+
+# ── Log files from test runs ────────────────────────────────────────────────
+*.log
