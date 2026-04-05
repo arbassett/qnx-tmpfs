@@ -113,7 +113,7 @@ tmpfs_inode_t *tmpfs_inode_alloc_root(tmpfs_mount_t *mnt, uid_t uid,
         return NULL;
     }
 
-    iofunc_attr_init(&ino->attr, S_IFDIR | (mode & 0777), NULL, NULL);
+    iofunc_attr_init(&ino->attr, S_IFDIR | (mode & 07777), NULL, NULL);
     ino->attr.inode  = TMPFS_ROOT_INO;
     ino->attr.mount  = &mnt->iofunc_mount;
     ino->attr.nlink  = 2;

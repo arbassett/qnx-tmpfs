@@ -202,11 +202,16 @@ int tmpfs_connect_open(resmgr_context_t *ctp, io_open_t *msg,
         struct _client_info cinfo;
         iofunc_client_info(ctp, 0, &cinfo);
 
+        /* Check write permission on the parent directory */
+        int rc = tmpfs_check_access(&parent->attr, W_OK, &cinfo);
+        if (rc != EOK)
+            return rc;
+
         ino = tmpfs_inode_alloc(mnt, S_IFREG | (mode & ~0111 & 0777), &cinfo);
         if (ino == NULL)
             return errno;
 
-        int rc = tmpfs_file_open_shm(ino);
+        rc = tmpfs_file_open_shm(ino);
         if (rc != EOK) {
             tmpfs_inode_free(ino);
             return rc;

@@ -22,6 +22,8 @@
 #include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <pwd.h>
+#include <grp.h>
 #include <sys/mman.h>
 #include <sys/memmsg.h>
 #include <sys/procmgr.h>
@@ -49,22 +51,82 @@ tmpfs_global_t g_tmpfs;
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-o size=<N[B|K|M|G|%%]>] <mountpoint>\n"
+        "Usage: %s [-o <opts>] <mountpoint>\n"
         "\n"
-        "  -o size=256M    mount with 256 MiB limit\n"
-        "  -o size=10%%     mount with 10%% of total RAM\n"
+        "Options (comma-separated with -o):\n"
+        "  size=256M       mount with 256 MiB limit\n"
+        "  size=10%%        mount with 10%% of total RAM\n"
+        "  uid=<n|name>    set root directory owner (numeric id or user name)\n"
+        "  gid=<n|name>    set root directory group (numeric id or group name)\n"
+        "  mode=<octal>    set root directory permissions (e.g. 755, 1777)\n"
         "\n"
         "  If size= is omitted, defaults to 25%% of total RAM.\n"
         "  Global cap across all mounts is 50%% of total RAM.\n"
+        "  If uid=/gid= are omitted, the mounting process uid/gid are used.\n"
+        "  If mode= is omitted, defaults to 0755.\n"
         "\n"
         "  Can also be invoked as 'mount_tmpfs' by the system mount command:\n"
-        "  mount -t tmpfs [-o size=N] none <mountpoint>\n",
+        "  mount -t tmpfs [-o size=N,uid=N,gid=N,mode=755] none <mountpoint>\n",
         prog);
 }
 
 /* -------------------------------------------------------------------------
+ * resolve_uid
+ *
+ * Resolve a uid= option value, which may be either a decimal numeric id
+ * or a user name string.  Sets *out and returns EOK on success, or returns
+ * EINVAL / ENOENT on failure.
+ * ---------------------------------------------------------------------- */
+static int resolve_uid(const char *val, uid_t *out)
+{
+    /* Try numeric first */
+    char *end;
+    unsigned long n = strtoul(val, &end, 10);
+    if (*val != '\0' && *end == '\0') {
+        *out = (uid_t)n;
+        return EOK;
+    }
+
+    /* Not purely numeric — look up as a user name */
+    struct passwd *pw = getpwnam(val);
+    if (pw == NULL) {
+        fprintf(stderr, "fs-tmpfs: unknown user '%s'\n", val);
+        return ENOENT;
+    }
+    *out = pw->pw_uid;
+    return EOK;
+}
+
+/* -------------------------------------------------------------------------
+ * resolve_gid
+ *
+ * Resolve a gid= option value, which may be either a decimal numeric id
+ * or a group name string.  Sets *out and returns EOK on success, or returns
+ * EINVAL / ENOENT on failure.
+ * ---------------------------------------------------------------------- */
+static int resolve_gid(const char *val, gid_t *out)
+{
+    /* Try numeric first */
+    char *end;
+    unsigned long n = strtoul(val, &end, 10);
+    if (*val != '\0' && *end == '\0') {
+        *out = (gid_t)n;
+        return EOK;
+    }
+
+    /* Not purely numeric — look up as a group name */
+    struct group *gr = getgrnam(val);
+    if (gr == NULL) {
+        fprintf(stderr, "fs-tmpfs: unknown group '%s'\n", val);
+        return ENOENT;
+    }
+    *out = gr->gr_gid;
+    return EOK;
+}
+
+/* -------------------------------------------------------------------------
  * Parse -o option string into a tmpfs_mount_req_t.
- * Supports: size=<value>
+ * Supports: size=<value>, uid=<n|name>, gid=<n|name>, mode=<octal>
  * Standard mount options (rw, ro, noexec, nosuid, noatime, etc.) are
  * silently accepted so the system mount command can pass them through.
  * ---------------------------------------------------------------------- */
@@ -96,6 +158,27 @@ static int parse_options(const char *opts, uint64_t total_ram,
                 return rc;
             }
             req->size_opt.bytes = sz;
+
+        } else if (strncmp(tok, "uid=", 4) == 0) {
+            int rc = resolve_uid(tok + 4, &req->uid);
+            if (rc != EOK)
+                return rc;
+
+        } else if (strncmp(tok, "gid=", 4) == 0) {
+            int rc = resolve_gid(tok + 4, &req->gid);
+            if (rc != EOK)
+                return rc;
+
+        } else if (strncmp(tok, "mode=", 5) == 0) {
+            char *end;
+            unsigned long m = strtoul(tok + 5, &end, 8);  /* octal */
+            if (end == tok + 5 || *end != '\0' || m > 07777) {
+                fprintf(stderr, "fs-tmpfs: invalid mode option '%s' "
+                        "(expected octal, e.g. 755 or 1777)\n", tok);
+                return EINVAL;
+            }
+            req->mode = (mode_t)m;
+
         } else {
             /* Check against known standard options before warning */
             int known = 0;
@@ -206,7 +289,15 @@ static void *drain_thread(void *arg)
 int main(int argc, char *argv[])
 {
     const char *mount_path = NULL;
-    const char *opt_string = NULL;
+
+    /*
+     * Combined options buffer.  mount(8) may pass each -o token as a
+     * separate flag (e.g. -o uid=1000 -o gid=1000 -o mode=700) rather than
+     * a single comma-joined string.  We accumulate all -o arguments here,
+     * joining them with commas, so parse_options sees one unified string.
+     */
+    char opt_buf[512];
+    opt_buf[0] = '\0';
 
     /*
      * Detect if we were invoked as "mount_tmpfs" by the system mount command.
@@ -217,6 +308,8 @@ int main(int argc, char *argv[])
      * where <special> is "none" (or a device hint we ignore for tmpfs) and
      * <mountpoint> is the target path. The -o string contains standard mount
      * options (rw, noexec, ...) plus any tmpfs-specific options (size=N).
+     * mount(8) may pass each option as its own separate -o flag rather than
+     * a single comma-joined string.
      *
      * In this mode we skip the -D and -h flags and treat the last argument
      * as the mountpoint and second-to-last as the special device.
@@ -231,13 +324,15 @@ int main(int argc, char *argv[])
 
     if (mount_cmd_mode) {
         /*
-         * mount_tmpfs -o <opts> <special> <mountpoint>
-         * getopt with just "o:" -- we only care about -o.
-         * The last argument is mountpoint, second-to-last is special (ignored).
+         * mount_tmpfs -o <opts> ... <special> <mountpoint>
+         * Accumulate every -o argument into opt_buf, comma-separated.
          */
         while ((opt = getopt(argc, argv, "o:")) != -1) {
-            if (opt == 'o')
-                opt_string = optarg;
+            if (opt == 'o') {
+                if (opt_buf[0] != '\0')
+                    strncat(opt_buf, ",", sizeof(opt_buf) - strlen(opt_buf) - 1);
+                strncat(opt_buf, optarg, sizeof(opt_buf) - strlen(opt_buf) - 1);
+            }
             /* ignore unknown options - mount may pass flags we don't know */
         }
 
@@ -255,7 +350,9 @@ int main(int argc, char *argv[])
         while ((opt = getopt(argc, argv, "o:Dh")) != -1) {
             switch (opt) {
             case 'o':
-                opt_string = optarg;
+                if (opt_buf[0] != '\0')
+                    strncat(opt_buf, ",", sizeof(opt_buf) - strlen(opt_buf) - 1);
+                strncat(opt_buf, optarg, sizeof(opt_buf) - strlen(opt_buf) - 1);
                 break;
             case 'D':
                 no_daemon = 1;
@@ -287,7 +384,7 @@ int main(int argc, char *argv[])
     req.gid  = getgid();
     req.mode = 0755;
 
-    int rc = parse_options(opt_string, total_ram, &req);
+    int rc = parse_options(opt_buf[0] ? opt_buf : NULL, total_ram, &req);
     if (rc != EOK)
         return 1;
 

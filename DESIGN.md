@@ -122,7 +122,9 @@ atomic_size_t   mount_used;
 
 ## Mount Size Options
 
-Specified via `-o size=<value>` at mount time, either directly or via `mount -t tmpfs -o size=<value>`.
+Specified via `-o <key>=<value>` at mount time, either directly or via `mount -t tmpfs -o <opts>`.
+
+#### Size Option
 
 | Format   | Meaning                          |
 |----------|----------------------------------|
@@ -133,10 +135,33 @@ Specified via `-o size=<value>` at mount time, either directly or via `mount -t 
 | `size=NG`| N * 1024³                        |
 | `size=N%`| N percent of total physical RAM  |
 
-### Constraints
+**Constraints**
 - `size=N%` requires `N <= 50` (global cap is 50%)
 - A mount cannot request more than the remaining global cap allows — error at mount time
 - **Default** if `-o size=` is omitted: **25% of total RAM**
+
+#### Ownership and Permissions Options
+
+These options set the uid, gid, and permission mode of the **root directory** of
+the mount. Files and directories created inside the mount inherit ownership from
+the creating process as normal; these options only affect the mount root itself.
+
+| Option          | Meaning                                                  |
+|-----------------|----------------------------------------------------------|
+| `uid=<n>`       | Set root dir owner to numeric uid `n`                    |
+| `uid=<name>`    | Set root dir owner to the uid of user `name`             |
+| `gid=<n>`       | Set root dir group to numeric gid `n`                    |
+| `gid=<name>`    | Set root dir group to the gid of group `name`            |
+| `mode=<octal>`  | Set root dir permission bits (octal, e.g. `755`, `1777`) |
+
+**Defaults**
+- `uid` defaults to the effective uid of the mounting process (`getuid()`)
+- `gid` defaults to the effective gid of the mounting process (`getgid()`)
+- `mode` defaults to `0755`
+
+**Name resolution** (`uid=name` / `gid=name`) calls `getpwnam()`/`getgrnam()`
+in the mounting process before delegating to the coordinator. The coordinator
+always receives resolved numeric ids in `tmpfs_mount_req_t`.
 
 ### Standard Mount Options
 
@@ -453,8 +478,10 @@ mount_tmpfs -o <options> <special> <mountpoint>
 - `<special>` is `none` for tmpfs (no backing device) — it is always the
   second-to-last argument and is silently ignored.
 - `<mountpoint>` is always the last argument.
-- `-o <options>` is a comma-separated list. Mount passes standard options
-  (`rw`, `noexec`, etc.) plus any options the user specified (`size=N`).
+- `-o <options>` — mount passes each option as a **separate `-o` flag**, not
+  as a single comma-joined string. For example, `-o uid=1000,gid=1000,mode=700`
+  arrives as three separate flags: `-o uid=1000 -o gid=1000 -o mode=700`.
+  See Implementation Note 24.
 
 ### `argv[0]` Detection
 
@@ -468,6 +495,11 @@ int mount_cmd_mode = (strcmp(progname, "mount_tmpfs") == 0);
 
 In `mount_cmd_mode`, only `-o` is accepted. The `-D` (no-daemon) and `-h`
 (help) flags are not available since `mount(8)` does not pass them.
+
+All `-o` arguments are accumulated into a single `opt_buf[512]` string
+(comma-separated) before being passed to `parse_options()`, so the parser
+always sees one unified token stream regardless of how many `-o` flags
+`mount(8)` emitted.
 
 ### `umount` Integration
 
@@ -485,7 +517,7 @@ if (flags & _MOUNT_UNMOUNT) {
 ### Usage
 
 ```sh
-# Mount with default size (25% of RAM)
+# Mount with default size (25% of RAM), mounting process uid/gid, mode 0755
 sudo mount -t tmpfs none /ramfs
 
 # Mount with explicit size
@@ -493,6 +525,15 @@ sudo mount -t tmpfs -o size=256M none /ramfs
 
 # Mount with percentage
 sudo mount -t tmpfs -o size=10% none /ramfs
+
+# Mount owned by uid 1000 / gid 1000 with restricted permissions
+sudo mount -t tmpfs -o uid=1000,gid=1000,mode=700 none /ramfs
+
+# Mount using user and group names
+sudo mount -t tmpfs -o uid=dae,gid=dae,mode=700 none /ramfs
+
+# Mount with sticky bit (shared /tmp-style)
+sudo mount -t tmpfs -o mode=1777 none /ramfs
 
 # Unmount
 sudo umount /ramfs
@@ -1123,6 +1164,10 @@ LIBS   = -lc
 | `mount -t tmpfs` says binary not found | `mount_tmpfs` not in PATH | Run `sudo make install` to create the symlink |
 | `umount` returns "Function not implemented" | `connect_funcs.mount` not registered | Register `tmpfs_connect_mount`; check `_MOUNT_UNMOUNT` flag |
 | `mount -t tmpfs -o size=N` warns about unknown opts | Standard opts not whitelisted | Add `rw`, `ro`, `noexec`, etc. to `std_opts[]` in `parse_options` |
+| `mount -t tmpfs -o uid=name` fails with ENOENT | User name not found | Ensure user exists on the mounting host; name resolved via `getpwnam()` before coordinator is contacted |
+| `uid=`, `gid=`, `mode=` options silently ignored when using `mount` | `mount(8)` splits `-o a,b,c` into separate `-o a -o b -o c` flags; original code kept only the last `-o` value | Accumulate all `-o` optargs into a single buffer with comma joining (see Note 24) |
+| Sticky bit / setuid / setgid stripped from mount root mode | `mode & 0777` in `tmpfs_inode_alloc_root` masked bits 9–11 | Use `mode & 07777` to preserve the full permission range (see Note 25) |
+| Non-root user can create files in a mode=700 directory they don’t own | `O_CREAT` path in `tmpfs_connect_open` relied on broken `iofunc_open` for parent write-permission check | Add explicit `tmpfs_check_access(&parent->attr, W_OK, &cinfo)` before inode alloc in the `O_CREAT` branch (see Note 26) |
 
 ---
 
@@ -1165,6 +1210,129 @@ sudo make install
 block device manager), not by `mount(8)` directly. Block-device filesystems
 follow a different plugin model; virtual/memory filesystems like tmpfs use
 the spawn model.
+
+---
+
+### 24. `mount(8)` Splits `-o a,b,c` Into Separate `-o a -o b -o c` Flags
+
+When the user runs:
+```sh
+mount -t tmpfs -o uid=1000,gid=1000,mode=700 none /ramfs
+```
+
+QNX `mount(8)` does **not** forward a single `-o uid=1000,gid=1000,mode=700`
+string to the spawned `mount_tmpfs`. Instead it splits the comma-separated
+list and passes each token as its own `-o` flag:
+```
+mount_tmpfs -o uid=1000 -o gid=1000 -o mode=700 none /ramfs
+```
+
+This was confirmed by replacing `mount_tmpfs` with a logging shell script and
+inspecting the captured `$@`.
+
+The original code used `opt_string = optarg` inside the `getopt` loop, which
+meant only the **last** `-o` value was retained. With three flags, only
+`mode=700` was ever parsed; `uid=` and `gid=` were silently dropped, and the
+mount root was always created with the coordinator process's uid/gid.
+
+**Fix**: Replace `const char *opt_string` with a `char opt_buf[512]`
+accumulator. Each iteration of the `getopt` loop appends `optarg` to
+`opt_buf` with a comma separator:
+
+```c
+char opt_buf[512];
+opt_buf[0] = '\0';
+
+while ((opt = getopt(argc, argv, "o:")) != -1) {
+    if (opt == 'o') {
+        if (opt_buf[0] != '\0')
+            strncat(opt_buf, ",", sizeof(opt_buf) - strlen(opt_buf) - 1);
+        strncat(opt_buf, optarg, sizeof(opt_buf) - strlen(opt_buf) - 1);
+    }
+}
+// parse_options sees: "uid=1000,gid=1000,mode=700"
+```
+
+This applies to both `mount_cmd_mode` and normal `fs-tmpfs` invocations.
+`parse_options` is unchanged — it always tokenises on commas.
+
+---
+
+### 25. `mode & 0777` Strips Sticky Bit, setuid, and setgid
+
+`tmpfs_inode_alloc_root` initialised the root directory inode with:
+```c
+iofunc_attr_init(&ino->attr, S_IFDIR | (mode & 0777), NULL, NULL);
+```
+
+The mask `0777` only covers the nine standard rwx bits. The special
+permission bits occupy the next octal digit:
+
+| Bit   | Octal  | Meaning  |
+|-------|--------|----------|
+| 01000 | sticky | Sticky   |
+| 02000 | setgid | Set-GID  |
+| 04000 | setuid | Set-UID  |
+
+Applying `& 0777` silently discarded these bits. A mount with `mode=1777`
+(sticky world-writable, as used for shared `/tmp`-style mounts) would be
+stored and reported as plain `0777` — confirmed with `stat` and
+`python3 -c "import os,stat; print(oct(stat.S_IMODE(os.stat('/ramfs').st_mode)))"`.
+
+**Fix**: Use `mode & 07777` to preserve all twelve permission bits:
+```c
+iofunc_attr_init(&ino->attr, S_IFDIR | (mode & 07777), NULL, NULL);
+```
+
+The `parse_options` validator already enforces `m <= 07777`, so no out-of-range
+value can reach `tmpfs_inode_alloc_root`.
+
+---
+
+### 26. `O_CREAT` in `tmpfs_connect_open` Bypasses Parent Write-Permission Check
+
+When a client calls `open(path, O_CREAT|O_WRONLY, mode)` on a path that does
+not yet exist, `tmpfs_connect_open` allocates a new inode and then calls
+`iofunc_open()` to complete the open. The expectation was that `iofunc_open`
+would reject the create if the client lacked write permission on the parent
+directory.
+
+However, as documented in Implementation Note 6, `iofunc_check_access` (and
+by extension `iofunc_open`'s internal permission check) is broken for non-root
+users on QNX 8 — it always returns EPERM regardless of mode bits, but also
+fails to block operations it *should* block. The net effect for `O_CREAT` is
+that the parent directory write-permission check is never enforced: a non-root
+user could create files inside a `mode=700` directory they did not own.
+
+This was observed during testing:
+```sh
+sudo mount -t tmpfs -o uid=1000,gid=1000,mode=700 none /ramfs
+# running as dae (uid=1001) — should be denied:
+touch /ramfs/test.txt   # succeeded (wrong)
+```
+
+All other mutating connect handlers (`unlink`, `rename`, `mknod`, `link`)
+already call `tmpfs_check_access` on the parent directly. The `O_CREAT` path
+in `tmpfs_connect_open` was the only one that did not.
+
+**Fix**: Add an explicit `tmpfs_check_access` call on the parent directory
+before allocating the new inode:
+
+```c
+// In tmpfs_connect_open, inside the O_CREAT branch:
+struct _client_info cinfo;
+iofunc_client_info(ctp, 0, &cinfo);
+
+/* Check write permission on the parent directory */
+int rc = tmpfs_check_access(&parent->attr, W_OK, &cinfo);
+if (rc != EOK)
+    return rc;
+
+ino = tmpfs_inode_alloc(mnt, S_IFREG | (mode & ~0111 & 0777), &cinfo);
+```
+
+This is consistent with the approach used in all other connect handlers and
+correctly enforces POSIX write-permission semantics for file creation.
 
 ---
 
