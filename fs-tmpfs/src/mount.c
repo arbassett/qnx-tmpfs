@@ -110,12 +110,24 @@ int tmpfs_mount_add(const tmpfs_mount_req_t *req)
     if (cap > g_tmpfs.global_cap - currently_used)
         return ENOSPC;
 
+    /* --- Resolve the inode cap --- */
+    uint64_t inode_cap;
+    if (req->nr_inodes == 0) {
+        /* Default: total_ram / (page_size * 2)  ==  half the RAM page count */
+        inode_cap = g_tmpfs.total_ram / TMPFS_DEFAULT_INODES_DENOM;
+    } else {
+        inode_cap = req->nr_inodes;
+    }
+    if (inode_cap < TMPFS_MIN_INODES)
+        inode_cap = TMPFS_MIN_INODES;
+
     /* --- Allocate mount structure --- */
     tmpfs_mount_t *mnt = calloc(1, sizeof(tmpfs_mount_t));
     if (mnt == NULL)
         return ENOMEM;
 
     mnt->mount_cap = (size_t)cap;
+    mnt->inode_cap = inode_cap;
     atomic_init(&mnt->mount_used, 0);
     atomic_init(&mnt->file_count, 0);
     atomic_init(&mnt->dir_count, 0);

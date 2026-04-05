@@ -117,6 +117,7 @@ int ctrl_io_devctl(resmgr_context_t *ctp, io_devctl_t *msg, iofunc_ocb_t *ocb)
         strncpy(stats->path, mnt->path, PATH_MAX - 1);
         stats->mount_cap      = mnt->mount_cap;
         stats->mount_used     = (uint64_t)atomic_load(&mnt->mount_used);
+        stats->inode_cap      = mnt->inode_cap;
         stats->file_count     = (uint64_t)atomic_load(&mnt->file_count);
         stats->dir_count      = (uint64_t)atomic_load(&mnt->dir_count);
         stats->symlink_count  = (uint64_t)atomic_load(&mnt->symlink_count);

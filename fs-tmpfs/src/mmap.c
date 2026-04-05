@@ -1,9 +1,18 @@
 /*
  * mmap.c  --  io_mmap handler.
  *
- * Redirects the client's mmap() call to the file's anonymous SHM backing
- * store so that the kernel can map those pages directly (zero copy).
- * Also handles msync to keep mtime accurate for MAP_SHARED writers.
+ * NOTE: mmap support (io_mmap -> SERVER_SHMEM_OBJECT) does not function on
+ * QNX 8.0 for user-space resmgr file descriptors.  The _IO_MMAP message
+ * is dispatched by memmgr to our handler, but the SERVER_SHMEM_OBJECT reply
+ * mechanism requires a kernel-level fd reference that user-space servers
+ * cannot produce.  memmgr returns EBADF to the mmap(2) caller regardless
+ * of what fd/coid values we place in the reply.
+ *
+ * The handler is kept registered so the slot is not ENOSYS, and returns
+ * ENODEV ("operation not supported on this device") to communicate clearly
+ * that mmap is unavailable rather than producing a confusing ENOSYS.
+ *
+ * See TODO.md for the tracking item.
  */
 
 #include <errno.h>
@@ -31,44 +40,12 @@
  * ---------------------------------------------------------------------- */
 int tmpfs_io_mmap(resmgr_context_t *ctp, io_mmap_t *msg, iofunc_ocb_t *ocb)
 {
-    tmpfs_inode_t *ino = INODE_FROM_OCB(ocb);
-
-    /* Only regular files can be mmap'd */
-    if (!S_ISREG(ino->attr.mode))
-        return ENODEV;
-
-    /* Must have a backing shm object */
-    if (ino->shm_fd == -1)
-        return ENODEV;
-
-    uint64_t requested_len = msg->i.requested_len;
-    uint64_t offset        = msg->i.offset;
-
-    /* Ensure we have enough backing capacity for the requested range */
-    if (requested_len > 0) {
-        size_t needed = (size_t)(offset + requested_len);
-        if (needed > ino->shm_cap) {
-            int rc = tmpfs_file_ensure_capacity(ino, needed);
-            if (rc != 0)
-                return rc;
-        }
-    }
-
-    /* Build the reply */
-    struct _io_mmap_reply *reply = &msg->o;
-    reply->zero         = 0;
-    reply->allowed_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-    reply->offset       = offset;
-    reply->fd           = ino->shm_fd;
-    reply->coid         = 0;
-
+    (void)ctp; (void)msg; (void)ocb;
     /*
-     * Tell the memory manager to map our SHM object directly.
-     * The kernel will duplicate shm_fd into the client's process.
+     * mmap via SERVER_SHMEM_OBJECT does not work on QNX 8.0 for user-space
+     * resmgr servers -- see file header comment and TODO.md.
      */
-    MsgReply(ctp->rcvid, _IO_MMAP_REPLY_FLAGS_SERVER_SHMEM_OBJECT,
-             reply, sizeof(*reply));
-    return _RESMGR_NOREPLY;
+    return ENODEV;
 }
 
 /* -------------------------------------------------------------------------

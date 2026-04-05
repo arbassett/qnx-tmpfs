@@ -56,17 +56,19 @@ static void usage(const char *prog)
         "Options (comma-separated with -o):\n"
         "  size=256M       mount with 256 MiB limit\n"
         "  size=10%%        mount with 10%% of total RAM\n"
+        "  nr_inodes=<n>   max inodes (k/m suffixes: 100k=100000, 1m=1000000)\n"
         "  uid=<n|name>    set root directory owner (numeric id or user name)\n"
         "  gid=<n|name>    set root directory group (numeric id or group name)\n"
         "  mode=<octal>    set root directory permissions (e.g. 755, 1777)\n"
         "\n"
         "  If size= is omitted, defaults to 25%% of total RAM.\n"
+        "  If nr_inodes= is omitted, defaults to half the number of RAM pages.\n"
         "  Global cap across all mounts is 50%% of total RAM.\n"
         "  If uid=/gid= are omitted, the mounting process uid/gid are used.\n"
         "  If mode= is omitted, defaults to 0755.\n"
         "\n"
         "  Can also be invoked as 'mount_tmpfs' by the system mount command:\n"
-        "  mount -t tmpfs [-o size=N,uid=N,gid=N,mode=755] none <mountpoint>\n",
+        "  mount -t tmpfs [-o size=N,nr_inodes=N,uid=N,gid=N,mode=755] none <mountpoint>\n",
         prog);
 }
 
@@ -125,6 +127,43 @@ static int resolve_gid(const char *val, gid_t *out)
 }
 
 /* -------------------------------------------------------------------------
+ * parse_nr_inodes
+ *
+ * Parse a nr_inodes= value.  Mirrors Linux tmpfs: supports plain decimal
+ * and decimal with k (×1,000) or m (×1,000,000) suffixes.
+ * Also accepts K/M/G binary suffixes for convenience (same as size=).
+ * Returns EOK on success, EINVAL on bad input.
+ * ---------------------------------------------------------------------- */
+static int parse_nr_inodes(const char *val, uint64_t *out)
+{
+    if (val == NULL || *val == '\0')
+        return EINVAL;
+
+    char *end;
+    unsigned long long n = strtoull(val, &end, 10);
+    if (end == val)
+        return EINVAL;
+
+    if (*end == '\0') {
+        *out = (uint64_t)n;
+    } else if (*end == 'k' || *end == 'K') {
+        /* Linux-style 'k' = 1,000 (decimal kilo); accept 'K' as alias */
+        *out = (uint64_t)n * 1000ULL;
+    } else if (*end == 'm' || *end == 'M') {
+        *out = (uint64_t)n * 1000ULL * 1000ULL;
+    } else if (*end == 'g' || *end == 'G') {
+        *out = (uint64_t)n * 1000ULL * 1000ULL * 1000ULL;
+    } else {
+        return EINVAL;
+    }
+
+    if (*out == 0)
+        return EINVAL;
+
+    return EOK;
+}
+
+/* -------------------------------------------------------------------------
  * Parse -o option string into a tmpfs_mount_req_t.
  * Supports: size=<value>, uid=<n|name>, gid=<n|name>, mode=<octal>
  * Standard mount options (rw, ro, noexec, nosuid, noatime, etc.) are
@@ -158,6 +197,14 @@ static int parse_options(const char *opts, uint64_t total_ram,
                 return rc;
             }
             req->size_opt.bytes = sz;
+
+        } else if (strncmp(tok, "nr_inodes=", 10) == 0) {
+            int rc = parse_nr_inodes(tok + 10, &req->nr_inodes);
+            if (rc != EOK) {
+                fprintf(stderr, "fs-tmpfs: invalid nr_inodes option '%s' "
+                        "(expected integer with optional k/m suffix, e.g. 100k)\n", tok);
+                return rc;
+            }
 
         } else if (strncmp(tok, "uid=", 4) == 0) {
             int rc = resolve_uid(tok + 4, &req->uid);

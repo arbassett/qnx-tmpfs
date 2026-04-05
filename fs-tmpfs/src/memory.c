@@ -96,3 +96,37 @@ size_t tmpfs_mem_used_mount(const tmpfs_mount_t *mnt)
 {
     return atomic_load_explicit(&mnt->mount_used, memory_order_relaxed);
 }
+
+/*
+ * tmpfs_inode_reserve  --  claim one inode slot against inode_cap.
+ *
+ * Uses a CAS loop so no inode is ever created that would push inode_count
+ * past inode_cap, even under concurrent allocation.
+ *
+ * Returns 0 on success, ENOSPC when the cap is reached.
+ */
+int tmpfs_inode_reserve(tmpfs_mount_t *mnt)
+{
+    uint_fast64_t old, new_val;
+
+    old = atomic_load_explicit(&mnt->inode_count, memory_order_relaxed);
+    do {
+        if (old >= mnt->inode_cap)
+            return ENOSPC;
+        new_val = old + 1;
+    } while (!atomic_compare_exchange_weak_explicit(
+                &mnt->inode_count,
+                &old, new_val,
+                memory_order_acquire,
+                memory_order_relaxed));
+
+    return 0;
+}
+
+/*
+ * tmpfs_inode_release  --  return one inode slot to the pool.
+ */
+void tmpfs_inode_release(tmpfs_mount_t *mnt)
+{
+    atomic_fetch_sub_explicit(&mnt->inode_count, 1, memory_order_release);
+}

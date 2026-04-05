@@ -42,6 +42,8 @@
 #include <sys/iomsg.h>
 #include <sys/mount.h>
 #include <sys/mman.h>
+#include <sys/statvfs.h>
+#include <sys/dcmd_blk.h>
 
 #include "../include/tmpfs_internal.h"
 #include "memory.h"
@@ -226,6 +228,15 @@ int tmpfs_connect_open(resmgr_context_t *ctp, io_open_t *msg,
             tmpfs_inode_free(ino);
             return rc;
         }
+
+        /*
+         * We JUST created this file. Clear O_EXCL from the ioflag so the
+         * pathmgr does not interpret the reply as "file already existed" and
+         * return EEXIST to the caller. The O_EXCL check (EEXIST if found) is
+         * handled in the FOUND branch above; reaching here means the file did
+         * not exist before this call.
+         */
+        msg->connect.ioflag &= ~(uint32_t)O_EXCL;
     } else {
         /* Found */
         if ((oflag & O_CREAT) && (oflag & O_EXCL))
@@ -333,8 +344,23 @@ int tmpfs_connect_unlink(resmgr_context_t *ctp, io_unlink_t *msg,
                                          &parent, &basename);
     if (ino == NULL)
         return ENOENT;
+    /* Can't remove the mount root */
+    if (ino == root)
+        return EBUSY;
     if (parent == NULL || basename == NULL)
-        return EBUSY; /* can't unlink mount root */
+        return EBUSY;
+
+    /*
+     * unlink(2) must fail with EISDIR if the target is a directory.
+     * rmdir(2) must fail with ENOTDIR if the target is not a directory.
+     * Distinguish by checking the mode field of the connect message:
+     * rmdir() sets S_IFDIR in msg->connect.mode; unlink() sets it to 0.
+     */
+    int is_rmdir = S_ISDIR(msg->connect.mode);
+    if (S_ISDIR(ino->attr.mode) && !is_rmdir)
+        return EISDIR;
+    if (!S_ISDIR(ino->attr.mode) && is_rmdir)
+        return ENOTDIR;
 
     /* Check: directories must be empty */
     if (S_ISDIR(ino->attr.mode)) {
@@ -548,8 +574,8 @@ int tmpfs_connect_readlink(resmgr_context_t *ctp, io_readlink_t *msg,
         (struct _io_connect_link_reply *)msg;
     memset(rep, 0, sizeof(*rep));
     rep->nentries = 0;
-    rep->path_len = (uint16_t)(tlen + 1);
-    memcpy((char *)rep + sizeof(*rep), target, tlen + 1);
+    rep->path_len = (uint16_t)tlen;  /* length NOT including null terminator */
+    memcpy((char *)rep + sizeof(*rep), target, tlen + 1); /* copy with null for safety */
 
     iov_t rl_iov;
     SETIOV(&rl_iov, rep, sizeof(*rep) + tlen + 1);
@@ -838,6 +864,57 @@ int tmpfs_io_write(resmgr_context_t *ctp, io_write_t *msg, iofunc_ocb_t *ocb)
 }
 
 /*
+ * tmpfs_io_devctl
+ *
+ * Handle devctl calls on files/directories within the mount.
+ * The primary use is DCMD_FSYS_STATVFS which libc's statvfs(3) sends to
+ * retrieve filesystem space statistics.
+ */
+int tmpfs_io_devctl(resmgr_context_t *ctp, io_devctl_t *msg, iofunc_ocb_t *ocb)
+{
+    if (msg->i.dcmd == DCMD_FSYS_STATVFS) {
+        tmpfs_inode_t *ino = INODE_FROM_OCB(ocb);
+        tmpfs_mount_t *mnt = ino->mount;
+
+        size_t used = atomic_load(&mnt->mount_used);
+        size_t cap  = mnt->mount_cap;
+        uint32_t bsize = (uint32_t)mnt->iofunc_mount.blocksize;
+        if (bsize == 0) bsize = 4096;
+
+        uint64_t total_blocks = cap  / bsize;
+        uint64_t free_blocks  = (used < cap) ? (cap - used) / bsize : 0;
+
+        uint64_t inodes_used  = atomic_load(&mnt->inode_count);
+        uint64_t inodes_cap   = mnt->inode_cap;
+        uint64_t inodes_free  = (inodes_used < inodes_cap)
+                                ? (inodes_cap - inodes_used) : 0;
+
+        struct __msg_statvfs *sv =
+            (struct __msg_statvfs *)_DEVCTL_DATA(msg->o);
+        memset(sv, 0, sizeof(*sv));
+        sv->f_bsize   = bsize;
+        sv->f_frsize  = bsize;
+        sv->f_blocks  = total_blocks;
+        sv->f_bfree   = free_blocks;
+        sv->f_bavail  = free_blocks;
+        sv->f_files   = inodes_cap;
+        sv->f_ffree   = inodes_free;
+        sv->f_favail  = inodes_free;
+        sv->f_fsid    = (uint32_t)mnt->iofunc_mount.dev;
+        sv->f_namemax = 255;
+        strncpy(sv->f_basetype, "tmpfs",
+                sizeof(sv->f_basetype) - 1);
+
+        msg->o.ret_val = EOK;
+        msg->o.nbytes  = sizeof(*sv);
+        return _RESMGR_PTR(ctp, &msg->o, sizeof(msg->o) + sizeof(*sv));
+    }
+
+    /* All other devctls on filesystem files: not supported */
+    return ENOSYS;
+}
+
+/*
  * tmpfs_io_close_ocb
  *
  * Save the inode pointer BEFORE calling iofunc_close_ocb_default
@@ -890,9 +967,12 @@ int tmpfs_io_space(resmgr_context_t *ctp, io_space_t *msg, iofunc_ocb_t *ocb)
         else
             rc = EOK;
     } else {
-        /* F_ALLOCSP: just ensure capacity without changing visible size */
-        size_t needed = (size_t)(msg->i.start + msg->i.len);
+        /* F_ALLOCSP (posix_fallocate): ensure capacity AND grow visible file
+         * size to cover the requested range, matching POSIX semantics. */
+        size_t needed   = (size_t)(msg->i.start + msg->i.len);
         rc = tmpfs_file_ensure_capacity(ino, needed);
+        if (rc == EOK && (off_t)needed > ino->attr.nbytes)
+            ino->attr.nbytes = (off_t)needed;
     }
     iofunc_attr_unlock(&ino->attr);
 
@@ -984,6 +1064,7 @@ int tmpfs_resmgr_init(void)
     g_io_funcs.chmod     = iofunc_chmod_default;
     g_io_funcs.chown     = iofunc_chown_default;
     g_io_funcs.utime     = iofunc_utime_default;
+    g_io_funcs.devctl    = tmpfs_io_devctl;
     g_io_funcs.mmap      = tmpfs_io_mmap;
     g_io_funcs.sync      = tmpfs_io_sync;
     g_io_funcs.space     = tmpfs_io_space;

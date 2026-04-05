@@ -46,6 +46,7 @@ typedef struct tmpfs_mount_req {
     uid_t               uid;               /* mounting user             */
     gid_t               gid;               /* mounting group            */
     mode_t              mode;              /* root dir permissions      */
+    uint64_t            nr_inodes;         /* max inodes; 0 = use default */
 } tmpfs_mount_req_t;
 
 typedef struct tmpfs_del_req {
@@ -76,6 +77,7 @@ typedef struct tmpfs_mount_stats {
     /* Output */
     uint64_t    mount_cap;              /* per-mount size limit, bytes  */
     uint64_t    mount_used;             /* bytes currently in use       */
+    uint64_t    inode_cap;              /* per-mount inode limit        */
     uint64_t    file_count;             /* number of regular files      */
     uint64_t    dir_count;              /* number of directories        */
     uint64_t    symlink_count;          /* number of symlinks           */

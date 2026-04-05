@@ -116,6 +116,8 @@ atomic_size_t   global_used;        // sum across ALL mounts
 // Per mount
 size_t          mount_cap;          // from -o size=N
 atomic_size_t   mount_used;
+uint64_t        inode_cap;          // from -o nr_inodes=N (default: total_ram_pages/2)
+atomic_uint_fast64_t inode_count;   // live inodes; checked against inode_cap on alloc
 ```
 
 ---
@@ -139,6 +141,34 @@ Specified via `-o <key>=<value>` at mount time, either directly or via `mount -t
 - `size=N%` requires `N <= 50` (global cap is 50%)
 - A mount cannot request more than the remaining global cap allows — error at mount time
 - **Default** if `-o size=` is omitted: **25% of total RAM**
+
+#### Inode Limit Option
+
+Controls the maximum number of inodes (files, directories, symlinks) the mount
+may contain at one time.  Reported as `f_files` / `f_ffree` / `f_favail` by
+`statvfs(2)`.
+
+| Format            | Meaning                                        |
+|-------------------|------------------------------------------------|
+| `nr_inodes=N`     | Exactly N inodes                               |
+| `nr_inodes=Nk`    | N × 1,000 (decimal kilo, Linux convention)     |
+| `nr_inodes=Nm`    | N × 1,000,000                                  |
+| `nr_inodes=Ng`    | N × 1,000,000,000                              |
+
+Note: `k`/`m`/`g` are **decimal** multipliers (×1,000 / ×1,000,000 / ×1,000,000,000)
+to match Linux `mount -t tmpfs -o nr_inodes=100k` convention.  Upper-case
+`K`/`M`/`G` are accepted as aliases.
+
+**Default** if `-o nr_inodes=` is omitted: **`total_ram / (PAGE_SIZE × 2)`**
+(half the number of physical RAM pages — mirrors Linux tmpfs default).
+
+**Floor**: regardless of the requested value, every mount is guaranteed at
+least `TMPFS_MIN_INODES` (16) inode slots.  Requesting a value below 16
+silently raises it to 16.
+
+**Enforcement**: inode allocation (files, directories, symlinks) fails with
+`ENOSPC` once `inode_count == inode_cap`.  Removing a file or directory
+returns its slot immediately, allowing new inodes to be created.
 
 #### Ownership and Permissions Options
 
@@ -211,10 +241,11 @@ Shrink condition: if current_size < capacity / 4
 tmpfs_mount_t
   ├── mount_cap                    ← maximum bytes this mount may use
   ├── mount_used (atomic)          ← bytes currently charged to this mount
+  ├── inode_cap                    ← maximum inodes this mount may hold (from -o nr_inodes=)
   ├── file_count (atomic_uint_fast64_t)
   ├── dir_count  (atomic_uint_fast64_t)
   ├── symlink_count (atomic_uint_fast64_t)
-  ├── inode_count (atomic_uint_fast64_t)
+  ├── inode_count (atomic_uint_fast64_t)  ← live inodes; also serves as the inode counter
   ├── resmgr_id                    ← id from resmgr_attach()
   ├── iofunc_mount_t iofunc_mount  ← QNX mount info (blocksize, dev, funcs)
   ├── root*                        ← root directory inode
@@ -525,6 +556,12 @@ sudo mount -t tmpfs -o size=256M none /ramfs
 
 # Mount with percentage
 sudo mount -t tmpfs -o size=10% none /ramfs
+
+# Mount with explicit inode limit (100,000 inodes)
+sudo mount -t tmpfs -o nr_inodes=100k none /ramfs
+
+# Mount with both size and inode limits
+sudo mount -t tmpfs -o size=512M,nr_inodes=1m none /ramfs
 
 # Mount owned by uid 1000 / gid 1000 with restricted permissions
 sudo mount -t tmpfs -o uid=1000,gid=1000,mode=700 none /ramfs
@@ -1165,6 +1202,8 @@ LIBS   = -lc
 | `umount` returns "Function not implemented" | `connect_funcs.mount` not registered | Register `tmpfs_connect_mount`; check `_MOUNT_UNMOUNT` flag |
 | `mount -t tmpfs -o size=N` warns about unknown opts | Standard opts not whitelisted | Add `rw`, `ro`, `noexec`, etc. to `std_opts[]` in `parse_options` |
 | `mount -t tmpfs -o uid=name` fails with ENOENT | User name not found | Ensure user exists on the mounting host; name resolved via `getpwnam()` before coordinator is contacted |
+| `nr_inodes=` option has no effect on inode limit | Old binary installed | Run `sudo make install` to update `/usr/bin/fs-tmpfs` |
+| `statvfs.f_files` is 0 or huge | Driver predates inode cap feature | Upgrade and remount |
 | `uid=`, `gid=`, `mode=` options silently ignored when using `mount` | `mount(8)` splits `-o a,b,c` into separate `-o a -o b -o c` flags; original code kept only the last `-o` value | Accumulate all `-o` optargs into a single buffer with comma joining (see Note 24) |
 | Sticky bit / setuid / setgid stripped from mount root mode | `mode & 0777` in `tmpfs_inode_alloc_root` masked bits 9–11 | Use `mode & 07777` to preserve the full permission range (see Note 25) |
 | Non-root user can create files in a mode=700 directory they don’t own | `O_CREAT` path in `tmpfs_connect_open` relied on broken `iofunc_open` for parent write-permission check | Add explicit `tmpfs_check_access(&parent->attr, W_OK, &cinfo)` before inode alloc in the `O_CREAT` branch (see Note 26) |
@@ -1333,6 +1372,61 @@ ino = tmpfs_inode_alloc(mnt, S_IFREG | (mode & ~0111 & 0777), &cinfo);
 
 This is consistent with the approach used in all other connect handlers and
 correctly enforces POSIX write-permission semantics for file creation.
+
+---
+
+### 27. Inode Cap — Two-Counter Design and `inode_count` Dual Role
+
+The inode limit uses `inode_count` for two purposes simultaneously:
+
+1. **Live counter**: tracks how many inodes currently exist in the mount
+   (reported as `statvfs.f_files - statvfs.f_ffree`).
+2. **Reservation gate**: `tmpfs_inode_reserve()` does a CAS loop on `inode_count`
+   to atomically check-and-increment, guaranteeing the cap is never exceeded
+   even under concurrent allocation from multiple threads.
+
+This means `inode_count` is **not** managed by `inode_stat_inc/dec` anymore.
+`inode_stat_inc` only updates the type-specific counters (`file_count`,
+`dir_count`, `symlink_count`). The increment/decrement of `inode_count` itself
+is done exclusively by `tmpfs_inode_reserve` / `tmpfs_inode_release`:
+
+```c
+// inode alloc:
+rc = tmpfs_inode_reserve(mnt);   // CAS loop: inode_count++ if < inode_cap
+if (rc != 0) { errno = rc; return NULL; }  // ENOSPC
+rc = tmpfs_mem_reserve(mnt, TMPFS_INODE_OVERHEAD);
+if (rc != 0) { tmpfs_inode_release(mnt); ... }
+
+// inode free:
+inode_stat_dec(ino);             // file_count / dir_count / symlink_count --
+tmpfs_inode_release(mnt);        // inode_count--
+tmpfs_mem_release(mnt, ...);
+```
+
+The CAS loop in `tmpfs_inode_reserve` is:
+```c
+old = atomic_load(&mnt->inode_count);
+do {
+    if (old >= mnt->inode_cap) return ENOSPC;
+    new_val = old + 1;
+} while (!atomic_compare_exchange_weak(&mnt->inode_count, &old, new_val));
+```
+
+This is safe under concurrent allocation because a thread that observes
+`inode_count == inode_cap - 1` and tries to increment will succeed exactly
+once; any concurrent thread that also observed `inode_cap - 1` will lose
+the CAS and retry, finding `inode_cap` on the second check and returning `ENOSPC`.
+
+#### `nr_inodes=` Suffix Convention
+
+Linux `mount -t tmpfs -o nr_inodes=100k` uses **decimal** kilo (×1,000),
+not binary kilo (×1,024).  Our implementation follows this convention:
+- `k`/`K` = ×1,000
+- `m`/`M` = ×1,000,000
+- `g`/`G` = ×1,000,000,000
+
+This differs from `size=` which uses binary suffixes (K=×1,024, M=×1,048,576).
+The distinction is intentional and matches Linux behaviour.
 
 ---
 

@@ -28,7 +28,7 @@ static void inode_stat_inc(tmpfs_inode_t *ino)
     tmpfs_mount_t *mnt = ino->mount;
     mode_t mode = ino->attr.mode;
 
-    atomic_fetch_add(&mnt->inode_count, 1);
+    /* inode_count was already incremented by tmpfs_inode_reserve() */
     if (S_ISREG(mode))       atomic_fetch_add(&mnt->file_count,    1);
     else if (S_ISDIR(mode))  atomic_fetch_add(&mnt->dir_count,     1);
     else if (S_ISLNK(mode))  atomic_fetch_add(&mnt->symlink_count, 1);
@@ -39,7 +39,7 @@ static void inode_stat_dec(tmpfs_inode_t *ino)
     tmpfs_mount_t *mnt = ino->mount;
     mode_t mode = ino->attr.mode;
 
-    atomic_fetch_sub(&mnt->inode_count, 1);
+    /* inode_count will be decremented by tmpfs_inode_release() */
     if (S_ISREG(mode))       atomic_fetch_sub(&mnt->file_count,    1);
     else if (S_ISDIR(mode))  atomic_fetch_sub(&mnt->dir_count,     1);
     else if (S_ISLNK(mode))  atomic_fetch_sub(&mnt->symlink_count, 1);
@@ -57,9 +57,17 @@ tmpfs_inode_t *tmpfs_inode_alloc(tmpfs_mount_t *mnt, mode_t mode,
 {
     int rc;
 
+    /* Reserve one inode slot against the inode cap */
+    rc = tmpfs_inode_reserve(mnt);
+    if (rc != 0) {
+        errno = rc;
+        return NULL;
+    }
+
     /* Reserve quota for the inode metadata */
     rc = tmpfs_mem_reserve(mnt, TMPFS_INODE_OVERHEAD);
     if (rc != 0) {
+        tmpfs_inode_release(mnt);
         errno = rc;
         return NULL;
     }
@@ -100,8 +108,16 @@ tmpfs_inode_t *tmpfs_inode_alloc(tmpfs_mount_t *mnt, mode_t mode,
 tmpfs_inode_t *tmpfs_inode_alloc_root(tmpfs_mount_t *mnt, uid_t uid,
                                        gid_t gid, mode_t mode)
 {
-    int rc = tmpfs_mem_reserve(mnt, TMPFS_INODE_OVERHEAD);
+    /* Reserve one inode slot (root dir counts against the cap) */
+    int rc = tmpfs_inode_reserve(mnt);
     if (rc != 0) {
+        errno = rc;
+        return NULL;
+    }
+
+    rc = tmpfs_mem_reserve(mnt, TMPFS_INODE_OVERHEAD);
+    if (rc != 0) {
+        tmpfs_inode_release(mnt);
         errno = rc;
         return NULL;
     }
@@ -188,6 +204,7 @@ void tmpfs_inode_free(tmpfs_inode_t *ino)
     }
 
     inode_stat_dec(ino);
+    tmpfs_inode_release(mnt);   /* decrement inode_count */
     tmpfs_mem_release(mnt, total_charge);
     free(ino);
 }

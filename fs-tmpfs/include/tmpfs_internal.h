@@ -87,11 +87,14 @@ struct tmpfs_mount {
     size_t              mount_cap;      /* maximum bytes this mount may use    */
     atomic_size_t       mount_used;     /* bytes currently charged to this mount */
 
+    /* Inode limit */
+    uint64_t            inode_cap;      /* maximum inodes this mount may hold  */
+
     /* Statistics counters */
     atomic_uint_fast64_t file_count;
     atomic_uint_fast64_t dir_count;
     atomic_uint_fast64_t symlink_count;
-    atomic_uint_fast64_t inode_count;
+    atomic_uint_fast64_t inode_count;   /* all live inodes (files+dirs+symlinks) */
 
     /* resmgr attachment */
     int                 resmgr_id;      /* id returned by resmgr_attach()      */

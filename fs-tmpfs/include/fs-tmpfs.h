@@ -36,6 +36,23 @@
 #define TMPFS_MAX_MOUNT_PERCENT         50
 
 /* -------------------------------------------------------------------------
+ * Inode limits
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Default per-mount inode cap when -o nr_inodes= is not specified.
+ * Mirrors Linux tmpfs: half the number of physical RAM pages.
+ * total_ram_pages = total_ram / page_size; default = total_ram_pages / 2.
+ * Expressed as a fraction of total_ram: default = total_ram / (page_size * 2).
+ * Page size is fixed at 4096 on QNX 8 aarch64.
+ */
+#define TMPFS_PAGE_SIZE                 4096ULL
+#define TMPFS_DEFAULT_INODES_DENOM      (TMPFS_PAGE_SIZE * 2)  /* total_ram / this */
+
+/* Hard floor: always allow at least this many inodes per mount */
+#define TMPFS_MIN_INODES                16ULL
+
+/* -------------------------------------------------------------------------
  * SHM backing store growth policy
  * ---------------------------------------------------------------------- */
 
