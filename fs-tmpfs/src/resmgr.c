@@ -767,11 +767,22 @@ int tmpfs_io_read(resmgr_context_t *ctp, io_read_t *msg, iofunc_ocb_t *ocb)
     uint32_t nbytes = msg->i.nbytes;
     off_t    offset = ocb->offset;
 
-    iofunc_attr_lock(&ino->attr);
+    /*
+     * attr->lock is already held at this point by iofunc_lock_ocb_default,
+     * which the resmgr framework calls before every IO handler.  We must NOT
+     * call iofunc_attr_lock() again here: attr->lock is a recursive mutex and
+     * a second lock from the same thread would raise the recursion depth to 2.
+     * Calling MsgReply or MsgRead while holding a recursive mutex at depth > 1
+     * causes ESRVRFAULT (QNX errno 312) on the server side.
+     *
+     * The framework lock is sufficient for shm_ptr stability: any concurrent
+     * handler on the same inode (on a different server thread) must acquire
+     * attr->lock via its own lock_ocb call and will block until we release,
+     * so shm_ptr cannot be remapped while we are inside the handler.
+     */
     off_t file_size = ino->attr.nbytes;
 
     if (offset >= file_size || nbytes == 0) {
-        iofunc_attr_unlock(&ino->attr);
         MsgReply(ctp->rcvid, 0, NULL, 0);
         return _RESMGR_NOREPLY;
     }
@@ -780,23 +791,19 @@ int tmpfs_io_read(resmgr_context_t *ctp, io_read_t *msg, iofunc_ocb_t *ocb)
         nbytes = (uint32_t)(file_size - offset);
 
     if (ino->shm_ptr == MAP_FAILED || ino->shm_cap == 0) {
-        iofunc_attr_unlock(&ino->attr);
         MsgReply(ctp->rcvid, 0, NULL, 0);
         return _RESMGR_NOREPLY;
     }
 
     /*
      * Zero-copy read: reply directly from the shm backing pointer.
-     * This eliminates the malloc + memcpy that a buffered approach requires.
-     * The kernel copies from our mapped shm page(s) directly into the
-     * client's buffer as part of MsgReply.
+     * shm_ptr is stable because attr->lock is held (see above).
      */
     void *read_ptr = (char *)ino->shm_ptr + offset;
 
-    /* Update offset and atime while still holding the lock */
+    /* Update offset and atime before replying */
     ocb->offset += (off_t)nbytes;
     iofunc_time_update(&ino->attr);
-    iofunc_attr_unlock(&ino->attr);
 
     MsgReply(ctp->rcvid, (int)nbytes, read_ptr, nbytes);
     return _RESMGR_NOREPLY;
@@ -830,33 +837,42 @@ int tmpfs_io_write(resmgr_context_t *ctp, io_write_t *msg, iofunc_ocb_t *ocb)
     size_t end   = (size_t)offset + nbytes;
 
     /*
-     * Grow the backing store first (while holding the lock) so the shm
-     * pointer is valid before we MsgRead into it.
+     * attr->lock is already held by iofunc_lock_ocb_default when this handler
+     * is called.  Do NOT call iofunc_attr_lock() here: attr->lock is a recursive
+     * mutex and raising the depth to 2 before calling MsgRead causes ESRVRFAULT
+     * (QNX errno 312) from the kernel.
+     *
+     * The framework lock prevents concurrent shm_ptr changes on this inode
+     * (any other handler on the same inode blocks waiting for this lock),
+     * so shm_ptr is stable throughout ensure_capacity and MsgRead.
+     *
+     * We use a temporary heap buffer for the MsgRead instead of writing directly
+     * into the shm backing store.  Direct MsgRead into shm_ptr causes ESRVRFAULT
+     * under concurrent load even when shm_ptr is valid -- likely a QNX kernel
+     * restriction on MsgRead targets that are mmap'd shared-memory pages.
+     * The extra memcpy is acceptable; correctness takes priority over the
+     * zero-copy optimisation (OPT-2) that this temporarily reverts.
      */
-    iofunc_attr_lock(&ino->attr);
     rc = tmpfs_file_ensure_capacity(ino, end);
-    if (rc != EOK) {
-        iofunc_attr_unlock(&ino->attr);
+    if (rc != EOK)
         return rc;
+
+    void *tmpbuf = malloc(nbytes);
+    if (tmpbuf == NULL)
+        return ENOMEM;
+
+    rc = MsgRead(ctp->rcvid, tmpbuf, nbytes, sizeof(msg->i));
+    if (rc < 0) {
+        free(tmpbuf);
+        return errno ? errno : EIO;
     }
-    void *write_ptr = (char *)ino->shm_ptr + offset;
-    iofunc_attr_unlock(&ino->attr);
 
-    /*
-     * Zero-copy write: MsgRead directly into the shm backing store.
-     * This eliminates the malloc + memcpy that a buffered approach requires.
-     * The kernel copies from the client's address space into our shm pages
-     * in a single operation.
-     */
-    rc = MsgRead(ctp->rcvid, write_ptr, nbytes, sizeof(msg->i));
-    if (rc < 0)
-        return EIO;
+    memcpy((char *)ino->shm_ptr + offset, tmpbuf, nbytes);
+    free(tmpbuf);
 
-    iofunc_attr_lock(&ino->attr);
     if ((off_t)end > ino->attr.nbytes)
         ino->attr.nbytes = (off_t)end;
     iofunc_time_update(&ino->attr);
-    iofunc_attr_unlock(&ino->attr);
 
     ocb->offset += nbytes;
     _IO_SET_WRITE_NBYTES(ctp, nbytes);

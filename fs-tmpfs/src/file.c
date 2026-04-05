@@ -120,35 +120,35 @@ static int shm_resize(tmpfs_inode_t *ino, size_t new_cap)
             ino->shm_ptr = ptr;
         } else {
             /*
-             * Extend the existing mapping with MAP_FIXED at the end of
-             * the current mapped region.  This avoids unmapping the old
-             * range and eliminates the expensive munmap + full remap.
-             * If MAP_FIXED fails (e.g. VA conflict), fall back to a full
-             * remap.
+             * Grow: full remap to a new non-overlapping address.
+             *
+             * We deliberately avoid MAP_FIXED for the extension even though
+             * it would be faster (~12x less overhead per resize).  MAP_FIXED
+             * silently unmaps any existing mapping at the target address,
+             * which can corrupt a concurrent inode whose shm region happens
+             * to start immediately after ours -- leading to ESRVRFAULT when
+             * MsgRead/MsgReply tries to access the unmapped pages.
+             *
+             * The correct solution would be MAP_FIXED_NOREPLACE (Linux 4.17+),
+             * but QNX 8 does not support it.  The msync probe we tried is also
+             * insufficient because another inode can be mmap'd into the range
+             * in the window between the probe and the MAP_FIXED call.
+             *
+             * Full remap (munmap + mmap(NULL)) is always safe because the OS
+             * picks a fresh non-overlapping VA range.
              */
             size_t old_cap = ino->shm_cap;
-            void *ext = mmap((char *)ino->shm_ptr + old_cap,
-                             new_cap - old_cap,
-                             PROT_READ | PROT_WRITE,
-                             MAP_SHARED | MAP_FIXED,
-                             ino->shm_fd,
-                             (off_t)old_cap);
-            if (ext == MAP_FAILED) {
-                /* MAP_FIXED failed: full remap */
-                munmap(ino->shm_ptr, old_cap);
-                void *ptr = mmap(NULL, new_cap,
-                                 PROT_READ | PROT_WRITE, MAP_SHARED,
-                                 ino->shm_fd, 0);
-                if (ptr == MAP_FAILED) {
-                    rc = errno;
-                    ino->shm_ptr = MAP_FAILED;
-                    /* Quota already reserved; release the delta */
-                    tmpfs_mem_release(ino->mount, delta);
-                    return rc;
-                }
-                ino->shm_ptr = ptr;
+            munmap(ino->shm_ptr, old_cap);
+            void *ptr = mmap(NULL, new_cap,
+                             PROT_READ | PROT_WRITE, MAP_SHARED,
+                             ino->shm_fd, 0);
+            if (ptr == MAP_FAILED) {
+                rc = errno;
+                ino->shm_ptr = MAP_FAILED;
+                tmpfs_mem_release(ino->mount, delta);
+                return rc;
             }
-            /* MAP_FIXED succeeded: shm_ptr stays the same, mapping extended */
+            ino->shm_ptr = ptr;
         }
 
         ino->shm_cap = new_cap;

@@ -5,6 +5,11 @@ test_tmpfs.py  --  POSIX conformance and feature tests for fs-tmpfs.
 Run as root (required for mount/umount):
     sudo python3 tests/test_tmpfs.py [-v]
 
+No setup required: the mount point (/ramfs) need not exist beforehand.
+fs-tmpfs registers with the QNX pathmgr directly; the path is created on
+mount and disappears on umount.  The binary is resolved from the build
+directory so `make install` is not required.
+
 Structure
 ---------
 Each TestCase class is self-contained: setUp mounts a fresh tmpfs, tearDown
@@ -109,8 +114,12 @@ def mount_direct(mountpoint, opts=None):
         cmd += ["-o", opts]
     cmd.append(mountpoint)
     _run(*cmd)
-    # Give coordinator a moment to attach
-    time.sleep(0.15)
+    # Poll until the coordinator registers /dev/fs-tmpfs (up to 2 s).
+    deadline = time.monotonic() + 2.0
+    while not coordinator_running():
+        if time.monotonic() > deadline:
+            raise RuntimeError("fs-tmpfs coordinator did not start within 2 s")
+        time.sleep(0.01)
 
 
 def mount_via_cmd(mountpoint, opts=None):
@@ -126,20 +135,23 @@ def mount_via_cmd(mountpoint, opts=None):
         cmd += ["-o", opts]
     cmd += ["none", mountpoint]
     _run(*cmd, check=False)   # mount(8) may return non-zero even on success
-    time.sleep(0.15)
-    # Verify the coordinator actually started
-    if not coordinator_running():
-        raise RuntimeError(f"mount_via_cmd failed: coordinator not running after: {cmd}")
+    # Poll until the coordinator registers /dev/fs-tmpfs (up to 2 s).
+    deadline = time.monotonic() + 2.0
+    while not coordinator_running():
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"mount_via_cmd failed: coordinator not running after: {cmd}")
+        time.sleep(0.01)
 
 
 def umount(mountpoint):
-    """Unmount and wait for coordinator cleanup."""
+    """Unmount and give the coordinator time to process the detach."""
     try:
         _run("umount", mountpoint, check=False)
     except Exception:
         pass
-    # Wait until the control path disappears or mount list shrinks.
-    # Just a short sleep is sufficient given the 100 ms grace period.
+    # The coordinator needs ~100 ms grace period after the last mount is
+    # removed before it exits.  Give it 200 ms to be safe.
     time.sleep(0.2)
 
 
@@ -225,7 +237,9 @@ class TmpfsTestBase(unittest.TestCase):
         if os.geteuid() != 0:
             self.skipTest("must run as root")
         ensure_mount_symlink()
-        os.makedirs(MOUNT_POINT, exist_ok=True)
+        # No need to pre-create the mount point directory: fs-tmpfs registers
+        # its path with the QNX pathmgr directly, so /ramfs need not exist as
+        # a real directory beforehand.  It also disappears cleanly after umount.
         # If a stale mount exists from a previous crash, clean it up.
         if coordinator_running():
             umount(MOUNT_POINT)
@@ -1197,26 +1211,46 @@ class TestEdgeCases(TmpfsTestBase):
         self.assertEqual(open(p, "rb").read(), b"second")
 
     def test_concurrent_writers(self):
-        """Two threads writing to different files simultaneously."""
+        """Multiple threads writing to different files simultaneously.
+
+        This exercises the shm_ptr stability fix: concurrent writes that
+        trigger backing-store resize must not race with MsgRead/MsgReply
+        on the same inode.
+        """
         import threading
+        NTHREADS   = 4
+        ITERATIONS = 8          # write+verify cycles per thread
+        FILE_SIZE  = 512 * 1024  # 512 KiB -- several resize events per file
+        CHUNK      = 4 * 1024    # 4 KiB records
+
         errors = []
+        buf = b"X" * CHUNK
 
-        def writer(name, data):
-            try:
-                p = self.path(name)
-                with open(p, "wb") as f:
-                    for _ in range(100):
-                        f.write(data)
-            except Exception as e:
-                errors.append(e)
+        def worker(tid):
+            for i in range(ITERATIONS):
+                p = self.path(f"t{tid}_i{i % 3}.bin")
+                try:
+                    with open(p, "wb") as f:
+                        written = 0
+                        while written < FILE_SIZE:
+                            f.write(buf)
+                            written += len(buf)
+                    # Verify size
+                    if os.stat(p).st_size != FILE_SIZE:
+                        errors.append(
+                            AssertionError(
+                                f"T{tid} iter{i}: wrong size {os.stat(p).st_size}"))
+                    os.unlink(p)
+                except Exception as e:
+                    errors.append(e)
 
-        t1 = threading.Thread(target=writer, args=("t1.bin", b"A" * 1024))
-        t2 = threading.Thread(target=writer, args=("t2.bin", b"B" * 1024))
-        t1.start(); t2.start()
-        t1.join();  t2.join()
-        self.assertEqual(errors, [])
-        self.assertEqual(os.stat(self.path("t1.bin")).st_size, 100 * 1024)
-        self.assertEqual(os.stat(self.path("t2.bin")).st_size, 100 * 1024)
+        threads = [
+            threading.Thread(target=worker, args=(tid,))
+            for tid in range(NTHREADS)
+        ]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [], f"concurrent write errors: {errors}")
 
 
 # ===========================================================================
@@ -1230,7 +1264,6 @@ class TestMountErrorHandling(unittest.TestCase):
         if os.geteuid() != 0:
             self.skipTest("must run as root")
         ensure_mount_symlink()
-        os.makedirs(MOUNT_POINT, exist_ok=True)
         if coordinator_running():
             umount(MOUNT_POINT)
             kill_coordinator()

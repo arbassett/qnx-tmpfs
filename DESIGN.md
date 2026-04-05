@@ -1204,6 +1204,8 @@ LIBS   = -lc
 | `mount -t tmpfs -o uid=name` fails with ENOENT | User name not found | Ensure user exists on the mounting host; name resolved via `getpwnam()` before coordinator is contacted |
 | `nr_inodes=` option has no effect on inode limit | Old binary installed | Run `sudo make install` to update `/usr/bin/fs-tmpfs` |
 | `statvfs.f_files` is 0 or huge | Driver predates inode cap feature | Upgrade and remount |
+| Concurrent writes crash the coordinator (ESRVRFAULT/SIGSEGV) | `MsgRead` into `MAP_SHARED` shm pages is unsafe on QNX 8; `MAP_FIXED` growth corrupts concurrent inode mappings | Use `malloc`+`MsgRead`+`memcpy` for writes; remove `MAP_FIXED` from `shm_resize` (see Note 28) |
+| Multi-threaded `write()` returns EIO or ESRCH | Old binary has concurrent write race | Rebuild from source |
 | `uid=`, `gid=`, `mode=` options silently ignored when using `mount` | `mount(8)` splits `-o a,b,c` into separate `-o a -o b -o c` flags; original code kept only the last `-o` value | Accumulate all `-o` optargs into a single buffer with comma joining (see Note 24) |
 | Sticky bit / setuid / setgid stripped from mount root mode | `mode & 0777` in `tmpfs_inode_alloc_root` masked bits 9–11 | Use `mode & 07777` to preserve the full permission range (see Note 25) |
 | Non-root user can create files in a mode=700 directory they don’t own | `O_CREAT` path in `tmpfs_connect_open` relied on broken `iofunc_open` for parent write-permission check | Add explicit `tmpfs_check_access(&parent->attr, W_OK, &cinfo)` before inode alloc in the `O_CREAT` branch (see Note 26) |
@@ -1430,6 +1432,91 @@ The distinction is intentional and matches Linux behaviour.
 
 ---
 
+### 28. Concurrent Writes — Two Bugs in the Zero-Copy Write Path
+
+The original zero-copy write handler (OPT-2 from the performance work) had a
+design that worked for single-threaded clients but failed under concurrent load:
+
+```c
+// ORIGINAL (broken under concurrency):
+iofunc_attr_lock(&ino->attr);
+tmpfs_file_ensure_capacity(ino, end);  // may remap shm_ptr
+void *write_ptr = (char *)ino->shm_ptr + offset;
+iofunc_attr_unlock(&ino->attr);        // RELEASE lock here
+
+MsgRead(ctp->rcvid, write_ptr, nbytes, ...);  // RACE: shm_ptr can change
+```
+
+Two bugs were present:
+
+#### Bug A — MAP_FIXED Growth Unmaps Concurrent Inode Mappings
+
+`shm_resize` used `mmap(addr, len, MAP_FIXED)` to extend a file's backing
+store in-place.  `MAP_FIXED` **silently unmaps any existing mapping** at the
+target address range.  Under concurrent load, a second inode's shm may have
+been mapped at exactly `ino->shm_ptr + old_cap`.  The `MAP_FIXED` extension
+for the first inode would then unmap the second inode's pages.  Any server
+thread concurrently calling `MsgRead`/`MsgReply` with a pointer into the
+unmapped region receives **ESRVRFAULT (errno 312)**, which the QNX kernel
+escalates to a **SIGSEGV** on the server process — crashing the coordinator.
+
+`MAP_FIXED_NOREPLACE` (Linux 4.17+) would fix this atomically, but QNX 8 does
+not support it.  An `msync` probe before `MAP_FIXED` has an inherent race: the
+range can be claimed by another `mmap(NULL)` call in the window between the
+probe and the `MAP_FIXED`.  **Fix**: remove `MAP_FIXED` entirely from the
+growth path.  Always use `munmap` + `mmap(NULL, new_cap)` to let the OS pick
+a fresh non-overlapping VA range.
+
+#### Bug B — Calling MsgRead/MsgReply into shm-Backed Memory at Mutex Depth > 1
+
+The handler attempted to hold `attr->lock` across `MsgRead` to prevent
+concurrent `shm_ptr` changes:
+
+```c
+iofunc_attr_lock(&ino->attr);   // depth 1 from lock_ocb_default
+iofunc_attr_lock(&ino->attr);   // depth 2 (recursive) — WRONG
+void *write_ptr = ino->shm_ptr + offset;
+MsgRead(ctp->rcvid, write_ptr, nbytes, ...);  // ESRVRFAULT at depth 2
+```
+
+The `iofunc_attr_t` mutex is `PTHREAD_MUTEX_RECURSIVE` on QNX.  The resmgr
+framework calls `iofunc_lock_ocb_default` before every IO handler, which locks
+`attr->lock` at depth 1.  Our additional `iofunc_attr_lock` raised it to depth
+2.  Calling `MsgRead` or `MsgReply` while holding the recursive mutex at
+depth 2 causes **ESRVRFAULT** from the QNX kernel — even when the destination
+buffer is valid heap memory.
+
+Additionally, even at depth 1 (the framework lock only, no extra lock),
+`MsgRead` directly into `shm`-backed pages causes ESRVRFAULT under
+concurrent load.  The exact kernel restriction is undocumented, but the
+effect is reproducible: `MsgRead` into a `MAP_SHARED` `SHM_ANON` mapping
+faults the server process when other threads are simultaneously writing to
+other inodes in the same process.
+
+**Fix**: use a temporary heap buffer (`malloc` + `MsgRead` + `memcpy` +
+`free`).  `MsgRead` into heap memory is always safe.  The `memcpy` into
+`shm_ptr` is protected by `attr->lock` at depth 1 (held by `lock_ocb_default`).
+This reverts OPT-2 (zero-copy write) in favour of correctness.
+
+#### Fix Summary
+
+```c
+// FIXED:
+// lock held at depth 1 from lock_ocb_default -- no extra lock needed
+rc = tmpfs_file_ensure_capacity(ino, end);  // safe: lock prevents concurrent resize
+void *tmpbuf = malloc(nbytes);
+MsgRead(ctp->rcvid, tmpbuf, nbytes, sizeof(msg->i));  // safe: heap target
+memcpy((char *)ino->shm_ptr + offset, tmpbuf, nbytes); // safe: under lock
+free(tmpbuf);
+```
+
+The read path (OPT-1, zero-copy `MsgReply` from `shm_ptr`) was not affected
+because the read handler correctly released the extra lock before calling
+`MsgReply` — but for consistency and future safety it was also cleaned up to
+rely solely on the framework's `lock_ocb_default` lock.
+
+---
+
 ## Performance Analysis & Optimisations
 
 ### Benchmark Tool
@@ -1563,47 +1650,56 @@ MsgReply(ctp->rcvid, (int)nbytes, read_ptr, nbytes);
 
 **Impact**: Read latency ~7 µs/call vs ~9 µs with the extra copy.
 
-#### OPT-2: Zero-Copy Write (`resmgr.c` — `tmpfs_io_write`)
+#### OPT-2: Zero-Copy Write (`resmgr.c` — `tmpfs_io_write`) ⚠️ Reverted for Correctness
 
 **Before**: `malloc(nbytes)` → `MsgRead(buf)` → `memcpy(buf→shm)` → `free(buf)`
 Two memory copies per write call.
 
-**After**: `MsgRead(shm_ptr + offset, nbytes)` — kernel copies directly from
+**After (original)**: `MsgRead(shm_ptr + offset, nbytes)` — kernel copies directly from
 the client's address space into our shm pages.
 One copy (unavoidable kernel copy in MsgRead).
 
+**Reverted**: Direct `MsgRead` into `MAP_SHARED` shm pages causes **ESRVRFAULT**
+under concurrent multi-threaded load on QNX 8 — the kernel faults the server
+process even when the target address is valid.  The implementation now uses a
+temporary heap buffer (`malloc` → `MsgRead` → `memcpy` → `free`) which is
+always safe.  See Implementation Note 28.
+
+**Current code** (temp buffer, safe):
 ```c
-/* Zero-copy: MsgRead directly into the shm backing store */
-void *write_ptr = (char *)ino->shm_ptr + offset;
-MsgRead(ctp->rcvid, write_ptr, nbytes, sizeof(msg->i));
+void *tmpbuf = malloc(nbytes);
+MsgRead(ctp->rcvid, tmpbuf, nbytes, sizeof(msg->i));
+memcpy((char *)ino->shm_ptr + offset, tmpbuf, nbytes);
+free(tmpbuf);
 ```
 
-**Impact**: Eliminates one `malloc`, one `memcpy`, and one `free` per write.
-Observable at large records; at 8 KiB the IPC cost dominates.
+**Impact**: Reverts the zero-copy benefit; ~8 KiB writes incur an extra `malloc`
++ `memcpy` + `free` per call.  This is not measurable at 8 KiB (IPC roundtrip
+dominates) but is visible at large records.
 
-#### OPT-3: MAP_FIXED Growth (`file.c` — `shm_resize`)
+#### OPT-3: MAP_FIXED Growth (`file.c` — `shm_resize`) ⚠️ Reverted for Correctness
 
 **Before**: When the backing store needed to grow, the old mapping was
 `munmap`'d, then `ftruncate` extended the file, then a full `mmap` created a
 new mapping at a new address. With 263 resize events per 256 MiB write at
 8 KiB records, this cost ~1.75 ms per resize = **~15 µs overhead per write**.
 
-**After**: On growth, `ftruncate` extends the backing size, then `mmap` with
+**After (original)**: On growth, `ftruncate` extends the backing size, then `mmap` with
 `MAP_FIXED` maps the new pages immediately adjacent to the existing mapping.
 The existing `shm_ptr` is unchanged. `munmap` is only called as a fallback
 if `MAP_FIXED` fails (VA conflict).
 
-```c
-/* Extend existing mapping in-place — no munmap of old range */
-void *ext = mmap((char *)ino->shm_ptr + old_cap,
-                 new_cap - old_cap,
-                 PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_FIXED,
-                 ino->shm_fd, (off_t)old_cap);
-```
+**Reverted**: `MAP_FIXED` **silently unmaps any existing mapping** at the target
+address, including another inode's shm region that the OS happened to place
+there.  Under concurrent writes, this corrupts the other inode's mapping and
+causes ESRVRFAULT.  `MAP_FIXED_NOREPLACE` (which would fix this atomically)
+is not available on QNX 8.  The implementation now always uses full
+`munmap` + `mmap(NULL)`, letting the OS pick a safe non-overlapping address.
+See Implementation Note 28.
 
-Resize cost: ~1.75 ms/event (old) → ~0.15 ms/event (new) — **12× faster**.
-Per-write overhead from resizes: 15 µs → 1.2 µs.
+**Impact**: Resize cost reverts to ~1.75 ms/event (from the optimised 0.15 ms).
+With OPT-4 still in place (no shrink on truncate), resizes still happen less
+frequently than in the original naive implementation.
 
 #### OPT-4: No-Shrink on Truncate (`file.c` — `tmpfs_file_truncate`)
 
@@ -1674,18 +1770,19 @@ If the bottleneck is IPC, the only fix is fewer, larger calls (application
 must use larger buffers). If it's page faults, pregrow (`ftruncate` to full
 size before writing) eliminates them.
 
-#### P3. MAP_FIXED Is the Correct Growth Strategy on QNX
+#### P3. MAP_FIXED Growth Strategy — Unsafe Under Concurrency
 
 `munmap` + `mmap` for every growth event is prohibitively expensive at small
-record sizes. The correct approach:
+record sizes.  `MAP_FIXED` for in-place extension was the chosen optimisation
+(OPT-3), but it is **unsafe** when multiple inodes are being grown concurrently:
+`MAP_FIXED` silently unmaps any mapping at the target address, including another
+inode's shm region.  This causes ESRVRFAULT and crashes the server.
 
-1. Initial allocation: `ftruncate(fd, initial_cap)` + `mmap(NULL, initial_cap, ...)`
-2. Growth: `ftruncate(fd, new_cap)` + `mmap(ptr + old_cap, delta, ..., MAP_FIXED, fd, old_cap)`
-3. Fallback: if `MAP_FIXED` fails, full `munmap` + `mmap`
-4. Free: `munmap(ptr, shm_cap)` once at inode destroy
+`MAP_FIXED_NOREPLACE` would solve this but is not available on QNX 8.
+The current implementation uses full `munmap` + `mmap(NULL)` to always get a
+non-overlapping VA range.  The per-resize cost reverts to ~1.75 ms/event.
 
-MAP_FIXED succeeds as long as there is no VA conflict at `ptr + old_cap`,
-which is guaranteed for a single growing mapping.
+See Implementation Note 28 for full details.
 
 #### P4. Never Shrink `shm_cap` on `ftruncate`
 
