@@ -40,6 +40,7 @@
 #include <sys/dispatch.h>
 #include <sys/stat.h>
 #include <sys/iomsg.h>
+#include <sys/mount.h>
 
 #include "../include/tmpfs_internal.h"
 #include "memory.h"
@@ -877,8 +878,51 @@ int tmpfs_io_space(resmgr_context_t *ctp, io_space_t *msg, iofunc_ocb_t *ocb)
 }
 
 /* =========================================================================
- * DISPATCH / THREAD POOL SETUP
+ * MOUNT CONNECT HANDLER
  * ====================================================================== */
+
+/*
+ * tmpfs_connect_mount
+ *
+ * Handles _IO_CONNECT_MOUNT messages delivered by the pathmgr when:
+ *   - umount(2) is called on one of our mount points (_MOUNT_UNMOUNT)
+ *   - mount(2) is called on a path we already serve (informational)
+ *
+ * For _MOUNT_UNMOUNT: tear down the mount, release all memory, resmgr_detach.
+ * For a standard mount on an existing path: already handled by the spawn of
+ * mount_tmpfs so we just return EOK.
+ */
+int tmpfs_connect_mount(resmgr_context_t *ctp, io_mount_t *msg,
+                         iofunc_attr_t *handle, io_mount_extra_t *extra)
+{
+    if (extra == NULL)
+        return EINVAL;
+
+    uint32_t flags = extra->flags;
+
+    if (flags & _MOUNT_UNMOUNT) {
+        /*
+         * Find which mount this resmgr id corresponds to and remove it.
+         * The path is recoverable from our mount list via resmgr_id.
+         */
+        pthread_rwlock_rdlock(&g_tmpfs.mounts_lock);
+        tmpfs_mount_t *mnt = tmpfs_mount_find_by_id(ctp->id);
+        char path[PATH_MAX];
+        if (mnt != NULL)
+            strncpy(path, mnt->path, sizeof(path) - 1);
+        pthread_rwlock_unlock(&g_tmpfs.mounts_lock);
+
+        if (mnt == NULL)
+            return ENOENT;
+
+        int rc = tmpfs_mount_remove(path);
+        return rc;
+    }
+
+    /* For a plain mount on an already-served path: nothing to do here,
+     * the actual mount was already set up by the spawn of mount_tmpfs. */
+    return EOK;
+}
 
 /*
  * tmpfs_resmgr_init
@@ -904,6 +948,7 @@ int tmpfs_resmgr_init(void)
     g_connect_funcs.mknod    = tmpfs_connect_mknod;
     g_connect_funcs.readlink = tmpfs_connect_readlink;
     g_connect_funcs.link     = tmpfs_connect_link;
+    g_connect_funcs.mount    = tmpfs_connect_mount;
 
     /* Override IO handlers */
     g_io_funcs.read      = tmpfs_io_read;

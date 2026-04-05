@@ -3,6 +3,10 @@
  *
  * Behaviour:
  *   1. Parse argv for mount path and -o size= option.
+ *      When invoked as "mount_tmpfs" (via `mount -t tmpfs`), the argument
+ *      format is: mount_tmpfs -o <opts> <special> <mountpoint>
+ *      Standard mount options (rw, ro, noexec, etc.) are silently ignored;
+ *      only tmpfs-specific options (size=) are acted upon.
  *   2. Try to connect to an existing coordinator at TMPFS_CTRL_PATH.
  *      - If found: send DCMD_TMPFS_ADD_MOUNT and exit.
  *      - If not:   become the coordinator (daemonise, init, attach).
@@ -51,17 +55,30 @@ static void usage(const char *prog)
         "  -o size=10%%     mount with 10%% of total RAM\n"
         "\n"
         "  If size= is omitted, defaults to 25%% of total RAM.\n"
-        "  Global cap across all mounts is 50%% of total RAM.\n",
+        "  Global cap across all mounts is 50%% of total RAM.\n"
+        "\n"
+        "  Can also be invoked as 'mount_tmpfs' by the system mount command:\n"
+        "  mount -t tmpfs [-o size=N] none <mountpoint>\n",
         prog);
 }
 
 /* -------------------------------------------------------------------------
- * Parse -o option string into a tmpfs_mount_req_t
+ * Parse -o option string into a tmpfs_mount_req_t.
  * Supports: size=<value>
+ * Standard mount options (rw, ro, noexec, nosuid, noatime, etc.) are
+ * silently accepted so the system mount command can pass them through.
  * ---------------------------------------------------------------------- */
 static int parse_options(const char *opts, uint64_t total_ram,
                           tmpfs_mount_req_t *req)
 {
+    /* Standard mount options we silently accept and ignore */
+    static const char * const std_opts[] = {
+        "rw", "ro", "exec", "noexec", "suid", "nosuid",
+        "atime", "noatime", "dev", "nodev", "remount",
+        "before", "after", "opaque", "nostat", "implied",
+        NULL
+    };
+
     if (opts == NULL)
         return EOK;
 
@@ -80,7 +97,16 @@ static int parse_options(const char *opts, uint64_t total_ram,
             }
             req->size_opt.bytes = sz;
         } else {
-            fprintf(stderr, "fs-tmpfs: unknown option '%s' (ignored)\n", tok);
+            /* Check against known standard options before warning */
+            int known = 0;
+            for (int i = 0; std_opts[i] != NULL; i++) {
+                if (strcmp(tok, std_opts[i]) == 0) {
+                    known = 1;
+                    break;
+                }
+            }
+            if (!known)
+                fprintf(stderr, "fs-tmpfs: unknown option '%s' (ignored)\n", tok);
         }
         tok = strtok(NULL, ",");
     }
@@ -182,31 +208,73 @@ int main(int argc, char *argv[])
     const char *mount_path = NULL;
     const char *opt_string = NULL;
 
+    /*
+     * Detect if we were invoked as "mount_tmpfs" by the system mount command.
+     *
+     * The mount(8) utility spawns us as:
+     *   mount_tmpfs -o <options> <special> <mountpoint>
+     *
+     * where <special> is "none" (or a device hint we ignore for tmpfs) and
+     * <mountpoint> is the target path. The -o string contains standard mount
+     * options (rw, noexec, ...) plus any tmpfs-specific options (size=N).
+     *
+     * In this mode we skip the -D and -h flags and treat the last argument
+     * as the mountpoint and second-to-last as the special device.
+     */
+    const char *progname = strrchr(argv[0], '/');
+    progname = progname ? progname + 1 : argv[0];
+    int mount_cmd_mode = (strcmp(progname, "mount_tmpfs") == 0);
+
     /* ---- Argument parsing ---- */
     int opt;
     int no_daemon = 0;
-    while ((opt = getopt(argc, argv, "o:Dh")) != -1) {
-        switch (opt) {
-        case 'o':
-            opt_string = optarg;
-            break;
-        case 'D':
-            no_daemon = 1;
-            break;
-        case 'h':
-            usage(argv[0]);
-            return 0;
-        default:
+
+    if (mount_cmd_mode) {
+        /*
+         * mount_tmpfs -o <opts> <special> <mountpoint>
+         * getopt with just "o:" -- we only care about -o.
+         * The last argument is mountpoint, second-to-last is special (ignored).
+         */
+        while ((opt = getopt(argc, argv, "o:")) != -1) {
+            if (opt == 'o')
+                opt_string = optarg;
+            /* ignore unknown options - mount may pass flags we don't know */
+        }
+
+        /* Need at least special + mountpoint after options */
+        if (optind + 2 > argc) {
+            fprintf(stderr, "mount_tmpfs: usage: mount_tmpfs -o opts special mountpoint\n");
+            return 1;
+        }
+
+        /* mountpoint is always the last argument; special is ignored */
+        mount_path = argv[argc - 1];
+
+    } else {
+        /* Normal fs-tmpfs invocation */
+        while ((opt = getopt(argc, argv, "o:Dh")) != -1) {
+            switch (opt) {
+            case 'o':
+                opt_string = optarg;
+                break;
+            case 'D':
+                no_daemon = 1;
+                break;
+            case 'h':
+                usage(argv[0]);
+                return 0;
+            default:
+                usage(argv[0]);
+                return 1;
+            }
+        }
+
+        if (optind >= argc) {
             usage(argv[0]);
             return 1;
         }
+        mount_path = argv[optind];
     }
-
-    if (optind >= argc) {
-        usage(argv[0]);
-        return 1;
-    }
-    mount_path = argv[optind];
 
     /* ---- Determine total RAM and global cap ---- */
     uint64_t total_ram = get_total_ram();

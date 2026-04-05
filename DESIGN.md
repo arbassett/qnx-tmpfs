@@ -8,14 +8,14 @@
 
 ## Goals & Requirements
 
-- Mount at multiple paths simultaneously
+- Mount at multiple paths simultaneously, including via the standard `mount -t tmpfs` command
 - Each mount has its own configurable maximum size
 - All mounts combined must never exceed **50% of total physical RAM**
 - Behave like a normal POSIX filesystem (`ENOSPC` on cap hit, etc.)
 - Support `mmap`
 - Support symlinks and hard links
 - Support standard POSIX permissions
-- Unmounting a mount immediately releases its memory back to the global pool
+- Unmounting a mount (via `umount` or `DCMD_TMPFS_DEL_MOUNT`) immediately releases its memory back to the global pool
 - Expose runtime statistics via a pseudo-device for CLI tooling
 - Coordinator daemon exits cleanly when the last mount is removed
 
@@ -25,9 +25,9 @@
 
 A single `fs-tmpfs` process acts as the coordinator for all mounts.
 
-### First Mount
+### First Mount — Direct Invocation
 ```
-fs-tmpfs [options] /mount/point
+fs-tmpfs [-o size=N] /mount/point
   → no coordinator found
   → daemonize
   → calculate total RAM, set global_cap = total_ram / 2
@@ -36,25 +36,43 @@ fs-tmpfs [options] /mount/point
   → enter thread pool dispatch loop
 ```
 
+### First Mount — via `mount` Command
+```
+mount -t tmpfs [-o size=N] none /mount/point
+  → mount(8) searches PATH for "mount_tmpfs"
+  → spawns: mount_tmpfs -o <opts> none /mount/point
+  → mount_tmpfs detects argv[0]=="mount_tmpfs", parses args
+  → no coordinator found
+  → daemonize, register /dev/fs-tmpfs
+  → resmgr_attach() for /mount/point
+  → enter thread pool dispatch loop
+```
+
 ### Subsequent Mounts
 ```
-fs-tmpfs [options] /another/point
+fs-tmpfs [-o size=N] /another/point
+  OR
+mount -t tmpfs [-o size=N] none /another/point
   → coordinator found via open(TMPFS_CTRL_PATH, O_RDWR)
   → send DCMD_TMPFS_ADD_MOUNT via devctl()
   → coordinator performs resmgr_attach() internally
   → invoking process exits cleanly
 ```
 
-### Unmount
+### Unmount — via `umount` Command
 ```
 umount /mount/point
-  → free all inodes for that mount
-  → decrement global_used
-  → resmgr_detach() for that mount point
-  → decrement mount_count
-  → if mount_count == 0:
-      → enter 100ms DRAINING grace period (accept any racing ADD_MOUNT)
-      → if no new mount arrives: deregister /dev/fs-tmpfs, exit(0)
+  → libc umount() sends _IO_CONNECT_MOUNT with _MOUNT_UNMOUNT flag
+  → pathmgr delivers message to our resmgr
+  → tmpfs_connect_mount() handler fires
+  → finds mount by resmgr_id, calls tmpfs_mount_remove(path)
+  → all inodes freed, global_used decremented, resmgr_detach()
+  → if mount_count == 0: 100ms grace period then daemon exits
+```
+
+### Unmount — via devctl
+```
+DCMD_TMPFS_DEL_MOUNT  →  tmpfs_mount_remove(path)  →  same teardown as above
 ```
 
 ---
@@ -104,7 +122,7 @@ atomic_size_t   mount_used;
 
 ## Mount Size Options
 
-Specified via `-o size=<value>` at mount time.
+Specified via `-o size=<value>` at mount time, either directly or via `mount -t tmpfs -o size=<value>`.
 
 | Format   | Meaning                          |
 |----------|----------------------------------|
@@ -119,6 +137,15 @@ Specified via `-o size=<value>` at mount time.
 - `size=N%` requires `N <= 50` (global cap is 50%)
 - A mount cannot request more than the remaining global cap allows — error at mount time
 - **Default** if `-o size=` is omitted: **25% of total RAM**
+
+### Standard Mount Options
+
+The following standard POSIX mount options are silently accepted and ignored
+(they are passed through by the `mount` command but have no effect on an
+in-memory filesystem):
+
+`rw`, `ro`, `exec`, `noexec`, `suid`, `nosuid`, `atime`, `noatime`,
+`dev`, `nodev`, `remount`, `before`, `after`, `opaque`, `nostat`, `implied`
 
 ---
 
@@ -274,6 +301,7 @@ operations, no OCB) and IO functions (fd-level operations, OCB exists).
 | `mknod`       | `tmpfs_connect_mknod`    | `mkdir()` and `mknod()` arrive here (subtype=5)    |
 | `readlink`    | `tmpfs_connect_readlink` | Returns target via `MsgReplyv(EOK, link_reply)`    |
 | `link`        | `tmpfs_connect_link`     | Hard links and symlink creation (extra_type check) |
+| `mount`       | `tmpfs_connect_mount`    | Handles `_MOUNT_UNMOUNT` from `umount(2)`          |
 
 ### IO Handlers (`resmgr_io_funcs_t`)
 
@@ -341,13 +369,13 @@ typedef struct tmpfs_mount_stats {
 
 ```
 fs-tmpfs/
-├── Makefile
+├── Makefile             (targets: all, clean, install, uninstall)
 ├── include/
 │   ├── fs-tmpfs.h          ← compile-time constants (pool sizes, shm thresholds, etc.)
 │   ├── tmpfs_ipc.h         ← public API: DCMD_* macros, stats structs, request structs
 │   └── tmpfs_internal.h    ← internal structs: inode, mount, ocb, global state
 ├── src/
-│   ├── main.c              ← entry point, -o parsing, coordinator bootstrap, RAM detection
+│   ├── main.c              ← entry point; handles both fs-tmpfs and mount_tmpfs invocations
 │   ├── resmgr.c            ← all connect + IO handlers, thread pool, iofunc_funcs_t
 │   ├── mount.c             ← mount attach/detach, size option parsing, tree teardown
 │   ├── inode.c             ← inode alloc/free, ref counting, inode number generation
@@ -359,6 +387,24 @@ fs-tmpfs/
 │   └── control.c           ← /dev/fs-tmpfs resmgr: devctl handlers, stats
 └── tools/
     └── tmpfs-stat.c        ← CLI stats tool (only needs tmpfs_ipc.h)
+```
+
+### Installation
+
+```sh
+sudo make install
+```
+
+Installs to `/usr/bin/`:
+
+| File                    | Description                                       |
+|-------------------------|---------------------------------------------------|
+| `/usr/bin/fs-tmpfs`     | The filesystem driver binary                      |
+| `/usr/bin/mount_tmpfs`  | Symlink → `fs-tmpfs`; found by `mount -t tmpfs`   |
+| `/usr/bin/tmpfs-stat`   | CLI stats tool                                    |
+
+```sh
+sudo make uninstall   # removes all three
 ```
 
 ### Build Order (minimises dependency issues)
@@ -377,6 +423,83 @@ fs-tmpfs/
 11. main.c              ← entry point, coordinator logic
 12. Makefile            ← ties it all together
 13. tools/tmpfs-stat.c  ← uses only tmpfs_ipc.h
+```
+
+---
+
+## `mount` Command Integration
+
+### How QNX `mount -t TYPE` Works
+
+The QNX `mount(8)` binary does **not** use `dlopen` for filesystem plugins.
+Instead it searches `PATH` for a binary named `mount_TYPE` and spawns it:
+
+```
+mount -t tmpfs [-o opts] none /path
+  → spawnp("mount_tmpfs", ["mount_tmpfs", "-o", "<opts>", "none", "/path"])
+```
+
+The spawned binary is responsible for starting the filesystem server and
+attaching to the mount point. This was confirmed by tracing `mount(8)` with
+`qtrace` and inspecting its disassembly.
+
+### Argument Format
+
+When invoked as `mount_tmpfs` the argument format is always:
+```
+mount_tmpfs -o <options> <special> <mountpoint>
+```
+
+- `<special>` is `none` for tmpfs (no backing device) — it is always the
+  second-to-last argument and is silently ignored.
+- `<mountpoint>` is always the last argument.
+- `-o <options>` is a comma-separated list. Mount passes standard options
+  (`rw`, `noexec`, etc.) plus any options the user specified (`size=N`).
+
+### `argv[0]` Detection
+
+`main.c` detects the invocation mode by checking the basename of `argv[0]`:
+
+```c
+const char *progname = strrchr(argv[0], '/');
+progname = progname ? progname + 1 : argv[0];
+int mount_cmd_mode = (strcmp(progname, "mount_tmpfs") == 0);
+```
+
+In `mount_cmd_mode`, only `-o` is accepted. The `-D` (no-daemon) and `-h`
+(help) flags are not available since `mount(8)` does not pass them.
+
+### `umount` Integration
+
+`umount /path` calls `libc umount()` which sends `_IO_CONNECT_MOUNT` with
+`_MOUNT_UNMOUNT` set in `extra->flags` to whichever resmgr serves that path.
+This is handled by `tmpfs_connect_mount()` registered in `connect_funcs.mount`:
+
+```c
+if (flags & _MOUNT_UNMOUNT) {
+    // find mount by ctp->id (resmgr_id)
+    tmpfs_mount_remove(path);  // frees all inodes, releases quota, detaches
+}
+```
+
+### Usage
+
+```sh
+# Mount with default size (25% of RAM)
+sudo mount -t tmpfs none /ramfs
+
+# Mount with explicit size
+sudo mount -t tmpfs -o size=256M none /ramfs
+
+# Mount with percentage
+sudo mount -t tmpfs -o size=10% none /ramfs
+
+# Unmount
+sudo umount /ramfs
+
+# Check stats
+tmpfs-stat
+tmpfs-stat /ramfs
 ```
 
 ---
@@ -997,3 +1120,48 @@ LIBS   = -lc
 | `truncate()` silently does nothing | Wrong handler registered | Handle `F_FREESP` in `io_space`, not a separate `io_truncate` |
 | Thread pool type-mismatch errors | `dispatch_*` vs `resmgr_*` | Use `resmgr_block/handler/context_alloc/context_free` |
 | devctl data not received by client | IOV pointed to stack variable | Write into `msg->o` (resmgr buffer); use `_RESMGR_PTR` |
+| `mount -t tmpfs` says binary not found | `mount_tmpfs` not in PATH | Run `sudo make install` to create the symlink |
+| `umount` returns "Function not implemented" | `connect_funcs.mount` not registered | Register `tmpfs_connect_mount`; check `_MOUNT_UNMOUNT` flag |
+| `mount -t tmpfs -o size=N` warns about unknown opts | Standard opts not whitelisted | Add `rw`, `ro`, `noexec`, etc. to `std_opts[]` in `parse_options` |
+
+---
+
+### 23. `mount -t TYPE` — QNX Spawns `mount_TYPE` From PATH
+
+QNX `mount(8)` does **not** use `dlopen` to load filesystem plugins. It does
+not look in `/usr/lib/dll` for a `.so` at mount time. Instead it uses `spawnp`
+to execute a binary named `mount_TYPE` found anywhere in `PATH`.
+
+This was confirmed by:
+1. `qtrace mount -t qnx6 ...` showing `spawnp` being called
+2. Placing a shell script named `mount_tmpfs` in `/usr/bin` and verifying it
+   was executed by `mount -t tmpfs`
+3. Inspecting `mount` strings: `mount_%s`, `exec:`, `exec %s for %s`
+
+The spawned binary receives arguments in this fixed format:
+
+```
+mount_TYPE  -o <opts>  <special>  <mountpoint>
+```
+
+Where:
+- `<opts>` always includes `rw` (or `ro`) from the mount flags, plus any
+  user-supplied `-o` options. They are comma-separated in a single string.
+- `<special>` is the device hint (`none` for virtual filesystems). It is
+  always `argv[argc-2]`.
+- `<mountpoint>` is always `argv[argc-1]`.
+
+The spawned process is responsible for becoming the filesystem server. In our
+case `mount_tmpfs` is a symlink to `fs-tmpfs` which detects the invocation
+mode via `argv[0]` and adjusts its argument parsing accordingly.
+
+**Installation**:
+```sh
+sudo make install
+# Creates: /usr/bin/fs-tmpfs, /usr/bin/mount_tmpfs -> fs-tmpfs, /usr/bin/tmpfs-stat
+```
+
+**Note**: `/usr/lib/dll/fs-qnx6.so` exists but is loaded by `io-blk` (the
+block device manager), not by `mount(8)` directly. Block-device filesystems
+follow a different plugin model; virtual/memory filesystems like tmpfs use
+the spawn model.
