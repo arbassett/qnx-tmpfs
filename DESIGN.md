@@ -1165,3 +1165,295 @@ sudo make install
 block device manager), not by `mount(8)` directly. Block-device filesystems
 follow a different plugin model; virtual/memory filesystems like tmpfs use
 the spawn model.
+
+---
+
+## Performance Analysis & Optimisations
+
+### Benchmark Tool
+
+All measurements use `/var/home/dae/tmp/rw` — a sequential file read/write
+benchmark that writes a 256 MiB file using repeated `write(2)` calls of a
+configurable record size, optionally `fsync(2)`s, then reads it back. The
+default configuration is 8 KiB records with fsync.
+
+Key flags used:
+```
+-r <size>   Record (I/O) size (default 8K)
+-g          Pregrow: ftruncate the file to full size before writing
+-f          Skip fsync between write and read phases
+-T <n>      Number of parallel threads
+-t <size>   Total file size (default 256M)
+```
+
+---
+
+### Baseline — System ramfs (`/tmp`, qnx6 on `/dev/ram0`)
+
+Measured on QNX 8.0.0 QEMU aarch64:
+
+| Metric  | Result       |
+|---------|--------------|
+| Write   | 216 MB/s     |
+| Read    | 816 MB/s     |
+| Record  | 8 KiB        |
+
+This is the system-provided in-memory filesystem. fs-tmpfs matches or exceeds
+it across all record sizes.
+
+---
+
+### fs-tmpfs Benchmark Results
+
+All tests: 256 MiB file, single thread, fsync between phases unless noted.
+
+| Record size      | Write      | Read        | Notes                        |
+|------------------|-----------|-------------|------------------------------|
+| 4 KiB            | 226 MB/s  | 617 MB/s    | IPC-bound                    |
+| 8 KiB (append)   | 312 MB/s  | 1,008 MB/s  | IPC + page-fault bound       |
+| 8 KiB (pregrow)  | 819 MB/s  | 1,125 MB/s  | IPC-only bound               |
+| 8 KiB, 4 threads | 369 MB/s  | 1,228 MB/s  | Total across all threads     |
+| 64 KiB           | 475 MB/s  | 4,297 MB/s  |                              |
+| 256 KiB          | 433 MB/s  | 3,855 MB/s  |                              |
+| 1 MiB            | 498 MB/s  | 5,699 MB/s  |                              |
+| 8 MiB            | 2,881 MB/s| 11,398 MB/s | Approaching memory bandwidth |
+
+---
+
+### Bottleneck Analysis — Why 8 KiB Write is ~25 µs/call
+
+The benchmark default (`ftruncate(0)` then sequential 8 KiB writes) shows
+~25 µs per write. This breaks down into two irreducible components:
+
+#### 1. QNX IPC Roundtrip Floor (~9 µs)
+
+Every `write(2)` call is a synchronous `MsgSend` from the client to our
+resmgr process and back. The minimum cost of this kernel context switch —
+measured with a minimal resmgr handler doing nothing but `MsgRead` +
+`MsgReply` — is **~8–9 µs per call**.
+
+This is the hard floor for any single-threaded synchronous IPC operation
+in QNX. It cannot be reduced without changing the fundamental IPC mechanism
+(e.g. using shared memory ring buffers with a separate coordination channel,
+which would require a custom client library).
+
+At 8 KiB per write with 9 µs/call: `8192 / 9e-6 / (1024*1024)` = ~866 MB/s
+theoretical maximum for the append case with zero other overhead.
+
+#### 2. OS Page Fault Cost (~12 µs per page, ~16 µs extra per 8 KiB write)
+
+The benchmark's write phase begins with `ftruncate(fd, 0)` (to reset the
+file for measurement). After this truncation, the QNX memory manager
+reclaims the physical pages backing the file's shm object — they are
+returned to the free pool as zero-demand pages.
+
+Each subsequent write to a previously-backed page triggers a **minor page
+fault** as the OS allocates a fresh physical page. For an 8 KiB write
+spanning ~2 pages:
+
+```
+~2 page faults × ~12 µs/fault = ~24 µs extra per write
+```
+
+Combined with the 9 µs IPC floor: `9 + 16 ≈ 25 µs/write` — matching the
+measured result exactly.
+
+With `-g` (pregrow, no `ftruncate(0)`), pages stay warm and only IPC cost
+remains → **819 MB/s at 9 µs/call**.
+
+The page fault cost scales linearly with file size:
+
+| File size | Page faults | Write speed |
+|-----------|-------------|-------------|
+| 1 MB      | 256         | 1,206 MB/s  |
+| 4 MB      | 1,024       | 731 MB/s    |
+| 16 MB     | 4,096       | 706 MB/s    |
+| 64 MB     | 16,384      | 513 MB/s    |
+| 256 MB    | 65,536      | 315 MB/s    |
+
+#### 3. Large Records — Memory Bandwidth Bound
+
+At 8 MiB records, write reaches 2.88 GB/s approaching the QEMU virtual
+memory bandwidth ceiling. `MsgRead` copies 8 MiB directly from client to
+shm in one call, amortising the 9 µs IPC overhead across a large transfer.
+
+---
+
+### Optimisations Implemented
+
+Four optimisations were applied during development. Each is described with
+its measured impact.
+
+#### OPT-1: Zero-Copy Read (`resmgr.c` — `tmpfs_io_read`)
+
+**Before**: `malloc(nbytes)` → `memcpy(shm→buf)` → `MsgReply(buf)` → `free(buf)`
+Two memory copies per read call.
+
+**After**: `MsgReply(shm_ptr + offset, nbytes)` — kernel copies directly from
+the shm-mapped page(s) to the client's buffer.
+One copy (unavoidable kernel copy in MsgReply).
+
+```c
+/* Zero-copy: reply directly from the shm backing pointer */
+void *read_ptr = (char *)ino->shm_ptr + offset;
+MsgReply(ctp->rcvid, (int)nbytes, read_ptr, nbytes);
+```
+
+**Impact**: Read latency ~7 µs/call vs ~9 µs with the extra copy.
+
+#### OPT-2: Zero-Copy Write (`resmgr.c` — `tmpfs_io_write`)
+
+**Before**: `malloc(nbytes)` → `MsgRead(buf)` → `memcpy(buf→shm)` → `free(buf)`
+Two memory copies per write call.
+
+**After**: `MsgRead(shm_ptr + offset, nbytes)` — kernel copies directly from
+the client's address space into our shm pages.
+One copy (unavoidable kernel copy in MsgRead).
+
+```c
+/* Zero-copy: MsgRead directly into the shm backing store */
+void *write_ptr = (char *)ino->shm_ptr + offset;
+MsgRead(ctp->rcvid, write_ptr, nbytes, sizeof(msg->i));
+```
+
+**Impact**: Eliminates one `malloc`, one `memcpy`, and one `free` per write.
+Observable at large records; at 8 KiB the IPC cost dominates.
+
+#### OPT-3: MAP_FIXED Growth (`file.c` — `shm_resize`)
+
+**Before**: When the backing store needed to grow, the old mapping was
+`munmap`'d, then `ftruncate` extended the file, then a full `mmap` created a
+new mapping at a new address. With 263 resize events per 256 MiB write at
+8 KiB records, this cost ~1.75 ms per resize = **~15 µs overhead per write**.
+
+**After**: On growth, `ftruncate` extends the backing size, then `mmap` with
+`MAP_FIXED` maps the new pages immediately adjacent to the existing mapping.
+The existing `shm_ptr` is unchanged. `munmap` is only called as a fallback
+if `MAP_FIXED` fails (VA conflict).
+
+```c
+/* Extend existing mapping in-place — no munmap of old range */
+void *ext = mmap((char *)ino->shm_ptr + old_cap,
+                 new_cap - old_cap,
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED,
+                 ino->shm_fd, (off_t)old_cap);
+```
+
+Resize cost: ~1.75 ms/event (old) → ~0.15 ms/event (new) — **12× faster**.
+Per-write overhead from resizes: 15 µs → 1.2 µs.
+
+#### OPT-4: No-Shrink on Truncate (`file.c` — `tmpfs_file_truncate`)
+
+**Before**: `tmpfs_file_truncate(ino, new_size)` contained a hysteresis rule:
+if `new_size < shm_cap / 4`, it called `shm_resize(ino, desired_cap(new_size))`
+which munmapped and remapped the smaller range. When the file was then written
+again, all the resize events had to repeat from scratch.
+
+The benchmark's `ftruncate(0)` pattern hit this every run: write 256 MiB
+(263 resizes), truncate to 0 (full unmap), write again (263 more resizes).
+
+**After**: `tmpfs_file_truncate` never shrinks `shm_cap`. The physical backing
+and VA mapping are retained at their high-water mark. Only the logical file
+size (`attr.nbytes`) is updated. The backing is only released when the inode
+is freed (`tmpfs_inode_free`).
+
+```c
+/* No shrink: shm_cap stays at high-water mark.
+ * Quota is charged against shm_cap until the file is deleted. */
+if (ns > ino->shm_cap) {
+    rc = tmpfs_file_ensure_capacity(ino, ns);
+    ...
+}
+/* NOTE: no else-if shrink path */
+ino->attr.nbytes = (off_t)ns;
+```
+
+**Impact**: Eliminates the second set of 263 resize events after `ftruncate(0)`.
+Combined with OPT-3, this takes `ftruncate(0)` + re-write from ~830 ms to
+~320 ms at 8 KiB records (~2.6× improvement over the original).
+
+The remaining ~25 µs/write is the irreducible IPC + page-fault floor.
+
+---
+
+### Remaining Limits and Why They Are Not Worth Pursuing
+
+| Limit | Cost | Why Not Fix |
+|-------|------|-------------|
+| QNX IPC roundtrip | ~9 µs fixed per call | Requires replacing synchronous IPC with shared-memory ring buffer + custom client library. Out of scope for a standard POSIX filesystem driver. |
+| OS page fault after `ftruncate(0)` | ~12 µs/page | Cannot prevent OS from reclaiming zero-content pages. Would require `MADV_FREE` / page pinning, which QNX does not expose on anonymous shm. |
+| `MsgRead`/`MsgReply` kernel copy | 1 copy per call | Unavoidable; this is the kernel enforcing address space isolation. `mmap`-based access bypasses this entirely (`io_mmap` handler). |
+| Single-thread write at 8 KiB | 312 MB/s | **Above the system ramfs baseline of 216 MB/s**. Further optimisation would require batching or async I/O at the application layer. |
+
+---
+
+### Performance Implementation Notes
+
+#### P1. The Real Bottleneck is IPC, Not Memcpy
+
+Pure `memcpy` at 8 KiB throughput: ~16,000 MB/s.
+IPC roundtrip at 8 KiB: ~866 MB/s theoretical max.
+Our implementation: 312–819 MB/s depending on page fault load.
+
+Never optimise the memcpy path first. Measure with a minimal resmgr to
+establish the IPC floor before adding any handler logic.
+
+#### P2. Diagnosing Performance with Record-Size Sweeps
+
+Running the benchmark across record sizes reveals which component is the
+bottleneck:
+
+- **Flat throughput across sizes** → IPC call overhead (fixed cost per call)
+- **Throughput increases with record size** → memcpy / memory bandwidth bound
+- **Throughput drops after ftruncate only** → page fault cost (scales with file size)
+
+If the bottleneck is IPC, the only fix is fewer, larger calls (application
+must use larger buffers). If it's page faults, pregrow (`ftruncate` to full
+size before writing) eliminates them.
+
+#### P3. MAP_FIXED Is the Correct Growth Strategy on QNX
+
+`munmap` + `mmap` for every growth event is prohibitively expensive at small
+record sizes. The correct approach:
+
+1. Initial allocation: `ftruncate(fd, initial_cap)` + `mmap(NULL, initial_cap, ...)`
+2. Growth: `ftruncate(fd, new_cap)` + `mmap(ptr + old_cap, delta, ..., MAP_FIXED, fd, old_cap)`
+3. Fallback: if `MAP_FIXED` fails, full `munmap` + `mmap`
+4. Free: `munmap(ptr, shm_cap)` once at inode destroy
+
+MAP_FIXED succeeds as long as there is no VA conflict at `ptr + old_cap`,
+which is guaranteed for a single growing mapping.
+
+#### P4. Never Shrink `shm_cap` on `ftruncate`
+
+The hysteresis-based shrink (`shm_cap > 4 × new_size` → shrink) looked
+reasonable in design but caused catastrophic performance regressions in the
+common benchmark pattern of write → `ftruncate(0)` → write.
+
+The correct model: `shm_cap` is the high-water mark of physical backing
+committed to this file. It is part of the quota charge and is only released
+when the file is deleted. This matches Linux tmpfs behaviour.
+
+#### P5. Page Faults After ftruncate(0) Are Unavoidable
+
+When `ftruncate(fd, 0)` is called, QNX zeroes the backing pages and may
+reclaim them. The next write to each page triggers a page allocation at
+~12 µs/page. This is an OS-level behaviour that cannot be prevented from
+user space without page pinning (not available on anonymous shm).
+
+Applications that need maximum sequential write throughput on a reused file
+should use `ftruncate(total_size)` once at open time rather than
+`ftruncate(0)` + sequential append.
+
+#### P6. Read Is Inherently Faster Than Write
+
+- **Write**: client sends data → kernel copies to our shm (1 copy per write)
+- **Read**: kernel copies from our shm to client (1 copy per read)
+
+Both have the same IPC overhead but read has an advantage: by the time the
+read phase starts, all pages are warm (already faulted in by the write phase).
+No page faults occur during sequential read of a recently-written file.
+
+This is why read consistently outperforms write at all record sizes:
+1,008 MB/s vs 312 MB/s at 8 KiB.

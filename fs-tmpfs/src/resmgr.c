@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <sys/iomsg.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 
 #include "../include/tmpfs_internal.h"
 #include "memory.h"
@@ -630,6 +631,10 @@ int tmpfs_connect_link(resmgr_context_t *ctp, io_link_t *msg,
  * tmpfs_io_read
  *
  * Handles both regular file reads and directory reads (readdir).
+ *
+ * Optimization: for regular files we reply directly from the shm pointer
+ * (MsgReply with shm_ptr+offset) eliminating the intermediate malloc+memcpy
+ * that the naive implementation uses.
  */
 int tmpfs_io_read(resmgr_context_t *ctp, io_read_t *msg, iofunc_ocb_t *ocb)
 {
@@ -743,32 +748,36 @@ int tmpfs_io_read(resmgr_context_t *ctp, io_read_t *msg, iofunc_ocb_t *ocb)
     if ((off_t)nbytes > file_size - offset)
         nbytes = (uint32_t)(file_size - offset);
 
-    void *buf = malloc(nbytes);
-    if (buf == NULL) {
+    if (ino->shm_ptr == MAP_FAILED || ino->shm_cap == 0) {
         iofunc_attr_unlock(&ino->attr);
-        return ENOMEM;
+        MsgReply(ctp->rcvid, 0, NULL, 0);
+        return _RESMGR_NOREPLY;
     }
 
-    ssize_t nread = tmpfs_file_read(ino, buf, nbytes, offset);
-    iofunc_attr_unlock(&ino->attr);
+    /*
+     * Zero-copy read: reply directly from the shm backing pointer.
+     * This eliminates the malloc + memcpy that a buffered approach requires.
+     * The kernel copies from our mapped shm page(s) directly into the
+     * client's buffer as part of MsgReply.
+     */
+    void *read_ptr = (char *)ino->shm_ptr + offset;
 
-    if (nread < 0) {
-        free(buf);
-        return EIO;
-    }
-
-    ocb->offset += nread;
-    iofunc_attr_lock(&ino->attr);
+    /* Update offset and atime while still holding the lock */
+    ocb->offset += (off_t)nbytes;
     iofunc_time_update(&ino->attr);
     iofunc_attr_unlock(&ino->attr);
 
-    MsgReply(ctp->rcvid, nread, buf, (size_t)nread);
-    free(buf);
+    MsgReply(ctp->rcvid, (int)nbytes, read_ptr, nbytes);
     return _RESMGR_NOREPLY;
 }
 
 /*
  * tmpfs_io_write
+ *
+ * Optimization: MsgRead directly into the shm backing store, eliminating
+ * the intermediate malloc+memcpy that the naive approach requires.
+ * The kernel copies from the client's address space directly into our
+ * mapped shm page(s) in a single operation.
  */
 int tmpfs_io_write(resmgr_context_t *ctp, io_write_t *msg, iofunc_ocb_t *ocb)
 {
@@ -786,29 +795,40 @@ int tmpfs_io_write(resmgr_context_t *ctp, io_write_t *msg, iofunc_ocb_t *ocb)
         return EOK;
     }
 
-    /* The write data follows the message header */
-    void *data = malloc(nbytes);
-    if (data == NULL)
-        return ENOMEM;
-
-    rc = MsgRead(ctp->rcvid, data, nbytes, sizeof(msg->i));
-    if (rc < 0) {
-        free(data);
-        return EIO;
-    }
-
     off_t offset = (ocb->ioflag & O_APPEND) ? ino->attr.nbytes : ocb->offset;
+    size_t end   = (size_t)offset + nbytes;
+
+    /*
+     * Grow the backing store first (while holding the lock) so the shm
+     * pointer is valid before we MsgRead into it.
+     */
+    iofunc_attr_lock(&ino->attr);
+    rc = tmpfs_file_ensure_capacity(ino, end);
+    if (rc != EOK) {
+        iofunc_attr_unlock(&ino->attr);
+        return rc;
+    }
+    void *write_ptr = (char *)ino->shm_ptr + offset;
+    iofunc_attr_unlock(&ino->attr);
+
+    /*
+     * Zero-copy write: MsgRead directly into the shm backing store.
+     * This eliminates the malloc + memcpy that a buffered approach requires.
+     * The kernel copies from the client's address space into our shm pages
+     * in a single operation.
+     */
+    rc = MsgRead(ctp->rcvid, write_ptr, nbytes, sizeof(msg->i));
+    if (rc < 0)
+        return EIO;
 
     iofunc_attr_lock(&ino->attr);
-    ssize_t nwritten = tmpfs_file_write(ino, data, nbytes, offset);
+    if ((off_t)end > ino->attr.nbytes)
+        ino->attr.nbytes = (off_t)end;
+    iofunc_time_update(&ino->attr);
     iofunc_attr_unlock(&ino->attr);
-    free(data);
 
-    if (nwritten < 0)
-        return errno;
-
-    ocb->offset += nwritten;
-    _IO_SET_WRITE_NBYTES(ctp, nwritten);
+    ocb->offset += nbytes;
+    _IO_SET_WRITE_NBYTES(ctp, nbytes);
     return EOK;
 }
 
