@@ -164,7 +164,7 @@ int tmpfs_mount_add(const tmpfs_mount_req_t *req)
         g_tmpfs.dpp,
         &attr,
         req->path,
-        _FTYPE_MOUNT,
+        _FTYPE_ANY,
         _RESMGR_FLAG_DIR | _RESMGR_FLAG_SELF | _RESMGR_FLAG_BEFORE,
         &g_connect_funcs,
         &g_io_funcs,
